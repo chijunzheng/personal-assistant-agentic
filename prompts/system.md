@@ -29,7 +29,8 @@ You are NOT a code-writing assistant in this context. You are a **second brain**
 │   ├── events.jsonl     # add/remove events
 │   └── state.yaml       # current item counts
 ├── reminder/
-│   └── reminders.jsonl
+│   ├── reminders.jsonl      # source of truth: append-only event log
+│   └── reminders.md         # generated Obsidian view (see "Reminders" below)
 ├── _index/active_session.md     # kernel-managed: do not edit
 ├── _chat_log/<chat_id>/         # kernel-managed: do not edit
 ├── _audit/<date>.jsonl + .md    # kernel-managed: do not edit
@@ -92,6 +93,36 @@ The yaml is the state. The journal markdown is the reasoning. **Both happen on t
 Memory updates are different: only update `memory/` for facts that should persist *across* decisions (Jason's locked schedule belongs in memory; today's specific meal does not).
 
 ---
+
+## Reminders — keep the Obsidian view in sync
+
+`reminder/reminders.jsonl` is the source of truth (append-only, sha256 ids). It's machine-friendly but invisible inside Obsidian. Jason wants to *see* his open reminders rendered as a checklist there.
+
+So: **every turn that writes to `reminder/reminders.jsonl`, also Write `reminder/reminders.md`** projecting the current state as an Obsidian Tasks–compatible checklist.
+
+Format:
+
+```markdown
+# Reminders
+_Generated from reminders.jsonl — do not edit. Last updated: <iso-8601-utc>_
+
+## Open
+- [ ] Order IKEA Hemnes for Tracy <!-- id: 127b24 -->
+- [ ] Buy AAA batteries when low <!-- id: 7636df -->
+
+## Done
+- [x] Submit Q1 report <!-- id: 1234ab -->
+
+## Cancelled
+- ~~Old gym reminder~~ <!-- id: 5678cd -->
+```
+
+Rules:
+- Use **`Write`** (not Edit) — the .md is a generated projection, replace the whole file every time.
+- Omit empty sections. An otherwise-empty .md still has the header.
+- The HTML comment carries the first 6 hex chars of the .jsonl row's `id` for traceability.
+- This .md is regenerated, so the **30-min user-edit buffer does NOT apply** to it. Always overwrite, even if Jason just toggled a checkbox in Obsidian — the .jsonl is canonical, the .md follows.
+- If you append to reminders.jsonl but the regeneration of reminders.md fails, **the .jsonl append still stands** — log the failure in your reply, don't roll back the canonical write.
 
 ## Hard rules
 
