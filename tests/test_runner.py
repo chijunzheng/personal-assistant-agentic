@@ -211,3 +211,153 @@ def test_build_user_message_handles_empty_session() -> None:
     msg = runner._build_user_message(user_msg="hi", sess=sess, recent_turns=[])
     assert "no prior notes this session" in msg
     assert "no prior turns in this session" in msg
+
+
+# ---------------------------------------------------------------------------
+# Attachment composition: combining user caption with saved-file paths
+# ---------------------------------------------------------------------------
+
+
+def test_compose_user_text_with_caption_and_one_attachment(tmp_path: Path) -> None:
+    """With a caption AND one attachment, the agent sees:
+
+        <caption>\\n\\n[attachment saved to: <rel>]
+
+    The relative path is computed against ``vault_root`` so the LLM
+    (running with ``cwd=vault_root``) can ``Read`` it directly.
+    """
+    vault_root = tmp_path
+    att = vault_root / "_inbox" / "raw" / "2026-05-11" / "120000-stmt.pdf"
+    att.parent.mkdir(parents=True, exist_ok=True)
+    att.write_bytes(b"x")
+
+    composed = runner._compose_user_text(
+        caption="april statement",
+        attachments=(att,),
+        vault_root=vault_root,
+    )
+    assert composed == (
+        "april statement\n\n"
+        "[attachment saved to: _inbox/raw/2026-05-11/120000-stmt.pdf]"
+    )
+
+
+def test_compose_user_text_with_empty_caption_only_attachment(tmp_path: Path) -> None:
+    """No caption + one attachment → just the bracketed notice, no
+    leading newlines or empty string prefix."""
+    att = tmp_path / "_inbox" / "raw" / "2026-05-11" / "130000-x.pdf"
+    att.parent.mkdir(parents=True, exist_ok=True)
+    att.write_bytes(b"x")
+
+    composed = runner._compose_user_text(
+        caption="",
+        attachments=(att,),
+        vault_root=tmp_path,
+    )
+    assert composed == "[attachment saved to: _inbox/raw/2026-05-11/130000-x.pdf]"
+    assert not composed.startswith("\n")
+
+
+def test_compose_user_text_no_attachments_is_passthrough(tmp_path: Path) -> None:
+    """Regression guard: with no attachments, the caption is returned
+    byte-for-byte. This keeps the existing text-only call path identical
+    to its pre-attachment behavior."""
+    for caption in ["hello", "", "multi\nline\ntext", "  spaces  "]:
+        out = runner._compose_user_text(
+            caption=caption,
+            attachments=(),
+            vault_root=tmp_path,
+        )
+        assert out == caption
+
+
+def test_compose_user_text_multiple_attachments(tmp_path: Path) -> None:
+    """Each attachment becomes its own ``[attachment saved to: ...]`` line,
+    appended after a blank line under the caption."""
+    a = tmp_path / "_inbox" / "raw" / "2026-05-11" / "100000-a.pdf"
+    b = tmp_path / "_inbox" / "raw" / "2026-05-11" / "100001-b.pdf"
+    for p in (a, b):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x")
+
+    composed = runner._compose_user_text(
+        caption="two files",
+        attachments=(a, b),
+        vault_root=tmp_path,
+    )
+    assert composed == (
+        "two files\n\n"
+        "[attachment saved to: _inbox/raw/2026-05-11/100000-a.pdf]\n"
+        "[attachment saved to: _inbox/raw/2026-05-11/100001-b.pdf]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# handle_turn with attachments — end-to-end wiring
+# ---------------------------------------------------------------------------
+
+
+def test_handle_turn_threads_attachments_into_user_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``handle_turn`` accepts ``attachments=`` and the synthesized user
+    message handed to ``invoke_claude`` contains the bracketed notice
+    with the vault-relative path."""
+    # Set up a fake vault.
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv("VAULT_ROOT", str(vault))
+
+    # Place an attachment so the relative-path computation works.
+    att = vault / "_inbox" / "raw" / "2026-05-11" / "120000-stmt.pdf"
+    att.parent.mkdir(parents=True, exist_ok=True)
+    att.write_bytes(b"x")
+
+    # Capture the assembled user message instead of spawning claude -p.
+    captured: dict[str, str] = {}
+
+    def fake_invoke_claude(user_message, **_kwargs):
+        captured["user_message"] = user_message
+        return ("ok", 1, 1, ())
+
+    monkeypatch.setattr(runner, "invoke_claude", fake_invoke_claude)
+
+    reply = runner.handle_turn(
+        chat_id="42",
+        user_msg="april statement",
+        attachments=(att,),
+    )
+
+    assert reply == "ok"
+    assert "april statement" in captured["user_message"]
+    assert (
+        "[attachment saved to: _inbox/raw/2026-05-11/120000-stmt.pdf]"
+        in captured["user_message"]
+    )
+
+
+def test_handle_turn_default_attachments_is_text_only_passthrough(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: calling ``handle_turn`` with no ``attachments``
+    kwarg produces a user message that does NOT contain the
+    ``[attachment saved to: ...]`` marker. Existing callers stay
+    behaviorally identical."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv("VAULT_ROOT", str(vault))
+
+    captured: dict[str, str] = {}
+
+    def fake_invoke_claude(user_message, **_kwargs):
+        captured["user_message"] = user_message
+        return ("ok", 1, 1, ())
+
+    monkeypatch.setattr(runner, "invoke_claude", fake_invoke_claude)
+
+    runner.handle_turn(chat_id="1", user_msg="just a text message")
+
+    assert "just a text message" in captured["user_message"]
+    assert "[attachment saved to:" not in captured["user_message"]
