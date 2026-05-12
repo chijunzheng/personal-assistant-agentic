@@ -101,6 +101,47 @@ def _load_system_prompt() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _compose_user_text(
+    *,
+    caption: str,
+    attachments: Sequence[Path],
+    vault_root: Path,
+) -> str:
+    """Merge the user's caption text with attachment-path notices.
+
+    Output shape:
+
+      * Caption + one attachment:
+          ``"<caption>\\n\\n[attachment saved to: <rel>]"``
+      * Caption + multiple attachments:
+          ``"<caption>\\n\\n[attachment saved to: <a>]\\n[attachment saved to: <b>]"``
+      * Empty caption + attachments:
+          ``"[attachment saved to: <rel>]"`` (just the notice(s))
+      * No attachments: caption is returned verbatim — guarantees the
+        existing text-only path is byte-identical.
+
+    Relative paths are computed against ``vault_root``. The LLM runs
+    with ``cwd=vault_root`` so it can call ``Read`` on the relative
+    path directly. Paths outside the vault fall back to the absolute
+    string representation.
+    """
+    if not attachments:
+        return caption
+
+    def _rel(p: Path) -> str:
+        try:
+            return str(p.resolve().relative_to(vault_root.resolve()))
+        except (ValueError, OSError):
+            return str(p)
+
+    notices = "\n".join(
+        f"[attachment saved to: {_rel(p)}]" for p in attachments
+    )
+    if caption:
+        return f"{caption}\n\n{notices}"
+    return notices
+
+
 def _format_chat_turns(turns: Sequence[chat_log.ChatTurn]) -> str:
     if not turns:
         return "(no prior turns in this session)"
@@ -443,15 +484,35 @@ def _summary_note(
     return f"{_now_iso()} | user: {snippet} | tools: {tool_names}"
 
 
-def handle_turn(*, chat_id: str, user_msg: str) -> str:
-    """Run one Telegram turn end-to-end and return the reply text."""
+def handle_turn(
+    *,
+    chat_id: str,
+    user_msg: str,
+    attachments: Sequence[Path] = (),
+) -> str:
+    """Run one Telegram turn end-to-end and return the reply text.
+
+    Args:
+        chat_id: Telegram chat id (stringified).
+        user_msg: the user's text — caption text from a file message or
+            the body of a plain text message. May be empty when the user
+            sends a file with no caption.
+        attachments: optional sequence of vault-relative or absolute
+            paths to files the bridge has already downloaded into the
+            vault. The runner threads each path into the LLM's user
+            message as ``[attachment saved to: <relative-path>]`` so the
+            LLM can ``Read`` it under ``cwd=vault_root``.
+    """
     vault_root = _vault_root()
     started = time.monotonic()
 
     sess = session.load_or_create(chat_id, vault_root=vault_root)
     recent_turns = chat_log.load_recent(chat_id, DEFAULT_CHAT_TURN_WINDOW, vault_root)
+    composed_msg = _compose_user_text(
+        caption=user_msg, attachments=attachments, vault_root=vault_root
+    )
     user_message = _build_user_message(
-        user_msg=user_msg, sess=sess, recent_turns=recent_turns
+        user_msg=composed_msg, sess=sess, recent_turns=recent_turns
     )
 
     try:
