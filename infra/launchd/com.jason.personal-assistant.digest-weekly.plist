@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Weekly reflection digest: proactive Sunday 6am push (GitHub issue #6).
+
+  Runs the agent.digest entrypoint in weekly mode every Sunday at 06:00
+  local time (see ProgramArguments below for the exact invocation). The
+  entrypoint invokes `claude -p` with `prompts/digest.md`; the LLM reviews
+  the last 7 days, Writes a `journal/YYYY-MM-DD-weekly-reflection.md` draft
+  itself, and replies with a short nudge that the entrypoint POSTs to
+  Telegram. See docs/adr/0002-proactive-digest-modality.md: the weekly
+  digest reuses the same proactive-push modality as the daily digest, so
+  no new ADR.
+
+  `Weekday` 0 in StartCalendarInterval is Sunday (7 is also Sunday).
+
+  Paths below are absolute and machine-specific. If the repo or venv
+  moves, update ProgramArguments[0], WorkingDirectory, and the log paths.
+
+  Install, smoke-test, and uninstall instructions live in
+  infra/launchd/README.md (the same three launchctl commands as the daily
+  job, with `digest-weekly` substituted for `digest-daily`).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jason.personal-assistant.digest-weekly</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/jasonchi/Library/CloudStorage/GoogleDrive-chijunzheng@gmail.com/My Drive/1.Projects/personal-assistant-agentic/.venv/bin/python</string>
+        <string>-m</string>
+        <string>agent.digest</string>
+        <string>--mode=weekly</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/jasonchi/Library/CloudStorage/GoogleDrive-chijunzheng@gmail.com/My Drive/1.Projects/personal-assistant-agentic</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/jasonchi/Library/CloudStorage/GoogleDrive-chijunzheng@gmail.com/My Drive/1.Projects/personal-assistant-agentic/logs/digest-weekly.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/jasonchi/Library/CloudStorage/GoogleDrive-chijunzheng@gmail.com/My Drive/1.Projects/personal-assistant-agentic/logs/digest-weekly.err.log</string>
+</dict>
+</plist>
