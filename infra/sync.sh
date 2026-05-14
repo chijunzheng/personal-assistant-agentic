@@ -13,7 +13,9 @@
 # a reset would re-pull and re-test the same bad commit every 5 min.
 set -euo pipefail
 
-REPO="/Users/jasonchi/Documents/Coding/personal-assistant-agentic"
+# Self-locating: REPO is the parent of this script's infra/ dir, so the
+# script keeps working regardless of where the checkout lives.
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
 BOT_LABEL="com.jasonchi.personal-assistant"
 cd "$REPO"
 
