@@ -23,6 +23,8 @@ PTB's ``message.reply_text`` from inside ``handle_turn``.
 
 from __future__ import annotations
 
+import asyncio
+import datetime as dt
 import logging
 import os
 import re
@@ -48,7 +50,9 @@ __all__ = [
     "MessageReplyFn",
     "build_application",
     "make_attachment_handler",
+    "make_digest_callback",
     "make_message_handler",
+    "register_digest_jobs",
     "run_polling_loop",
 ]
 
@@ -218,6 +222,88 @@ def _pick_attachment_source(message) -> tuple[object | None, str]:
     return None, ""
 
 
+# ---------------------------------------------------------------------------
+# In-process digest scheduling (#9)
+#
+# The bot is a permanently-running process on an always-on Mac mini, so the
+# digest jobs live inside it via PTB's ``JobQueue`` rather than two launchd
+# plists. See ``docs/adr/0003-in-process-digest-scheduling.md``. The digest
+# *logic* is untouched — these jobs only call the existing
+# ``run_daily_digest`` / ``run_weekly_digest`` from ``agent/digest.py``.
+# ---------------------------------------------------------------------------
+
+# Both digests fire at 06:00 the host's local wall-clock time. The time is
+# tz-aware on purpose: a naive ``datetime.time`` is interpreted by PTB as the
+# bot's default timezone (UTC), which would fire at the wrong hour.
+_DIGEST_HOUR = 6
+_DIGEST_MINUTE = 0
+
+# PTB 21 day indices: 0-6 == Sunday-Saturday. Daily runs every day; the
+# weekly reflection runs Sundays only.
+_EVERY_DAY = (0, 1, 2, 3, 4, 5, 6)
+_SUNDAY_ONLY = (0,)
+
+
+def _local_digest_time() -> dt.time:
+    """06:00 as a tz-aware ``datetime.time`` in the host's local timezone.
+
+    ``datetime.now().astimezone().tzinfo`` resolves the machine's configured
+    zone (e.g. ``America/Los_Angeles`` on the Mac mini) without hardcoding
+    it, so the digest tracks the host even across a relocation or DST.
+    """
+    local_tz = datetime.now().astimezone().tzinfo
+    return dt.time(hour=_DIGEST_HOUR, minute=_DIGEST_MINUTE, tzinfo=local_tz)
+
+
+def make_digest_callback(run_fn: Callable[[], str]):
+    """Wrap a synchronous digest run function as a PTB job callback.
+
+    ``run_daily_digest`` / ``run_weekly_digest`` are synchronous (they spawn
+    ``claude -p`` and POST to Telegram via ``urllib``). PTB job callbacks are
+    coroutines, so we offload the blocking run to a thread executor — keeping
+    the bot's polling loop responsive while the digest generates.
+    """
+
+    async def _callback(_context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            await asyncio.to_thread(run_fn)
+        except Exception:  # noqa: BLE001 — a failed digest must not kill the bot
+            logger.exception("scheduled digest run failed")
+
+    return _callback
+
+
+def register_digest_jobs(job_queue) -> None:
+    """Register the daily and weekly digest jobs on ``job_queue``.
+
+    Two recurring jobs, both at 06:00 local time:
+      * ``digest-daily``  — every day, dispatches to ``run_daily_digest``
+      * ``digest-weekly`` — Sundays only, dispatches to ``run_weekly_digest``
+
+    The callbacks invoke the *existing* digest functions from
+    ``agent/digest.py``; digest logic is not duplicated here. Imported
+    lazily so the bridge module has no import-time dependency on the digest
+    module (and tests can register jobs without it).
+    """
+    from agent.digest import run_daily_digest, run_weekly_digest
+
+    schedule_time = _local_digest_time()
+
+    job_queue.run_daily(
+        make_digest_callback(run_daily_digest),
+        time=schedule_time,
+        days=_EVERY_DAY,
+        name="digest-daily",
+    )
+    job_queue.run_daily(
+        make_digest_callback(run_weekly_digest),
+        time=schedule_time,
+        days=_SUNDAY_ONLY,
+        name="digest-weekly",
+    )
+    logger.info("registered in-process digest jobs (daily + weekly, 06:00 local)")
+
+
 def build_application(
     *,
     reply_fn: MessageReplyFn,
@@ -256,6 +342,16 @@ def build_application(
                 ),
             )
         )
+
+    # Register the proactive digest jobs in-process (#9). The job-queue
+    # extra (APScheduler) must be installed for ``application.job_queue``
+    # to be non-None; ``pyproject.toml`` declares it as a hard dependency.
+    if application.job_queue is None:
+        raise RuntimeError(
+            "JobQueue unavailable — install python-telegram-bot[job-queue]"
+        )
+    register_digest_jobs(application.job_queue)
+
     return application
 
 
