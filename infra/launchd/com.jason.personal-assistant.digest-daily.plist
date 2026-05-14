@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Daily digest — proactive 6am push (GitHub issue #5).
+
+  Fires `python -m agent.digest --mode=daily` every day at 06:00 local
+  time. The entrypoint invokes `claude -p` with `prompts/digest.md`,
+  then POSTs the result to Telegram via the Bot API. See
+  docs/adr/0002-proactive-digest-modality.md for why launchd + a
+  standalone entrypoint rather than an in-process scheduler.
+
+  Paths below are absolute and machine-specific. If the repo or venv
+  moves, update ProgramArguments[0], WorkingDirectory, and the log paths.
+
+  Load / unload / smoke-test:
+
+    # install (load) — run once, or after editing this file:
+    launchctl unload ~/Library/LaunchAgents/com.jason.personal-assistant.digest-daily.plist 2>/dev/null
+    cp infra/launchd/com.jason.personal-assistant.digest-daily.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.jason.personal-assistant.digest-daily.plist
+
+    # smoke test — trigger immediately without waiting for 6am:
+    launchctl start com.jason.personal-assistant.digest-daily
+    tail -f logs/digest-daily.err.log logs/digest-daily.out.log
+
+    # uninstall (unload):
+    launchctl unload ~/Library/LaunchAgents/com.jason.personal-assistant.digest-daily.plist
+    rm ~/Library/LaunchAgents/com.jason.personal-assistant.digest-daily.plist
+
+  See infra/launchd/README.md for the same instructions plus troubleshooting.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jason.personal-assistant.digest-daily</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/jasonchi/Library/CloudStorage/GoogleDrive-chijunzheng@gmail.com/My Drive/1.Projects/personal-assistant-agentic/.venv/bin/python</string>
+        <string>-m</string>
+        <string>agent.digest</string>
+        <string>--mode=daily</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/jasonchi/Library/CloudStorage/GoogleDrive-chijunzheng@gmail.com/My Drive/1.Projects/personal-assistant-agentic</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/jasonchi/Library/CloudStorage/GoogleDrive-chijunzheng@gmail.com/My Drive/1.Projects/personal-assistant-agentic/logs/digest-daily.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/jasonchi/Library/CloudStorage/GoogleDrive-chijunzheng@gmail.com/My Drive/1.Projects/personal-assistant-agentic/logs/digest-daily.err.log</string>
+</dict>
+</plist>
