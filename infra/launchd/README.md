@@ -10,14 +10,24 @@ and exit when done.
 | Plist | Schedule | Entrypoint |
 |---|---|---|
 | `com.jason.personal-assistant.digest-daily.plist` | 06:00 daily | `python -m agent.digest --mode=daily` |
+| `com.jason.personal-assistant.digest-weekly.plist` | 06:00 Sundays | `python -m agent.digest --mode=weekly` |
+
+The daily digest is a read-only morning push. The weekly digest is a
+Sunday reflection turn: the agent Writes a
+`journal/YYYY-MM-DD-weekly-reflection.md` draft into the vault and sends a
+short Telegram nudge pointing at it. Both reuse the same proactive-push
+modality — see `docs/adr/0002-proactive-digest-modality.md`.
 
 ## Install / load
 
 `launchd` agents live in `~/Library/LaunchAgents/`. The plists in this
-directory are the source of truth — copy them in, then `load`:
+directory are the source of truth — copy them in, then `load`. Set
+`PLIST` to whichever job you're installing:
 
 ```sh
 PLIST=com.jason.personal-assistant.digest-daily.plist
+# or, for the weekly reflection job:
+PLIST=com.jason.personal-assistant.digest-weekly.plist
 
 # unload an old copy first if one is already loaded (no-op otherwise):
 launchctl unload ~/Library/LaunchAgents/$PLIST 2>/dev/null
@@ -27,25 +37,36 @@ launchctl load ~/Library/LaunchAgents/$PLIST
 ```
 
 Re-run the same three lines after editing a plist — `launchd` only picks
-up changes on reload.
+up changes on reload. Install both jobs to run both digests.
 
-## Smoke test (don't wait for 6am)
+## Smoke test (don't wait for the schedule)
 
 ```sh
+# daily:
 launchctl start com.jason.personal-assistant.digest-daily
 tail -f logs/digest-daily.err.log logs/digest-daily.out.log
+
+# weekly (don't wait for Sunday 6am):
+launchctl start com.jason.personal-assistant.digest-weekly
+tail -f logs/digest-weekly.err.log logs/digest-weekly.out.log
 ```
 
 `launchctl start` runs the job immediately, ignoring the schedule. A
-successful run pushes the digest to Telegram and exits 0; a failure
-(missing env, `claude -p` error, network error) exits non-zero and the
-traceback lands in `logs/digest-daily.err.log`.
+successful daily run pushes the digest to Telegram and exits 0; a
+successful weekly run writes the reflection draft, pushes the nudge, and
+exits 0. A failure (missing env, `claude -p` error, network error) exits
+non-zero and the traceback lands in the job's `.err.log`.
 
 ## Uninstall / unload
 
 ```sh
+# daily:
 launchctl unload ~/Library/LaunchAgents/com.jason.personal-assistant.digest-daily.plist
 rm ~/Library/LaunchAgents/com.jason.personal-assistant.digest-daily.plist
+
+# weekly:
+launchctl unload ~/Library/LaunchAgents/com.jason.personal-assistant.digest-weekly.plist
+rm ~/Library/LaunchAgents/com.jason.personal-assistant.digest-weekly.plist
 ```
 
 ## Troubleshooting

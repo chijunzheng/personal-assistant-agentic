@@ -10,9 +10,15 @@ End-to-end behavior is covered by the launchd smoke test documented in
 
 from __future__ import annotations
 
+import plistlib
+from pathlib import Path
+
 import pytest
 
 from agent import digest
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_LAUNCHD_DIR = _REPO_ROOT / "infra" / "launchd"
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +87,15 @@ def test_unknown_mode_raises_digest_error() -> None:
         digest.build_digest_argv_prompt_path("monthly")
 
 
+def test_weekly_mode_selects_weekly_digest_prompt() -> None:
+    """``--mode=weekly`` resolves to ``prompts/digest.md`` — the weekly
+    reflection digest reuses the same digest contract file as daily; the
+    weekly *section* inside it drives the reflection-oriented behavior."""
+    path = digest.build_digest_argv_prompt_path("weekly")
+    assert path.name == "digest.md"
+    assert path.parent.name == "prompts"
+
+
 # ---------------------------------------------------------------------------
 # generate_digest: assembles the correct claude -p invocation
 # ---------------------------------------------------------------------------
@@ -111,6 +126,38 @@ def test_generate_digest_invokes_claude_with_digest_prompt(tmp_path) -> None:
     assert captured["system_prompt"].strip() != ""
     # The user message is the digest trigger, not a Telegram message.
     assert "digest" in str(captured["user_message"]).lower()
+
+
+def test_generate_digest_weekly_uses_distinct_user_message(tmp_path) -> None:
+    """``generate_digest(mode="weekly")`` is distinguishable from
+    ``mode="daily"`` in the invocation: the user message names the weekly
+    reflection turn, so the LLM acts on the weekly section of the prompt
+    and Writes a reflection draft rather than producing a daily push."""
+    captured: dict[str, object] = {}
+
+    def fake_invoke(user_message, *, cwd, system_prompt, **_kwargs):
+        captured["user_message"] = user_message
+        return ("reflection draft ready", 1, 1, ())
+
+    daily_msg_holder: dict[str, object] = {}
+
+    def fake_invoke_daily(user_message, *, cwd, system_prompt, **_kwargs):
+        daily_msg_holder["user_message"] = user_message
+        return ("daily digest", 1, 1, ())
+
+    digest.generate_digest(
+        mode="weekly", vault_root=tmp_path, invoke_fn=fake_invoke
+    )
+    digest.generate_digest(
+        mode="daily", vault_root=tmp_path, invoke_fn=fake_invoke_daily
+    )
+
+    weekly_msg = str(captured["user_message"]).lower()
+    daily_msg = str(daily_msg_holder["user_message"]).lower()
+    assert "weekly" in weekly_msg
+    assert "reflection" in weekly_msg
+    # The two modes must not send the same trigger message.
+    assert weekly_msg != daily_msg
 
 
 def test_generate_digest_wraps_claude_error_as_digest_error(tmp_path) -> None:
@@ -193,6 +240,84 @@ def test_run_daily_digest_requires_chat_id(tmp_path, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# run_weekly_digest: end-to-end wiring (generate -> push), env-driven
+# ---------------------------------------------------------------------------
+
+
+def test_run_weekly_digest_generates_then_pushes(tmp_path, monkeypatch) -> None:
+    """``run_weekly_digest`` reads env, generates the weekly reflection via
+    ``claude -p`` (the LLM Writes the draft into ``journal/`` itself), and
+    pushes the short nudge to Telegram addressed by ``TELEGRAM_CHAT_ID``.
+    It reuses ``send_telegram_message`` — the push helper is not
+    duplicated."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv("VAULT_ROOT", str(vault))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "999:XYZ")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "5240954069")
+
+    seen: dict[str, object] = {}
+    sent: dict[str, object] = {}
+
+    def fake_invoke(user_message, *, cwd, system_prompt, **_kwargs):
+        seen["user_message"] = user_message
+        return ("weekly reflection's ready in journal/...", 1, 1, ())
+
+    def fake_post(url: str, payload: dict) -> None:
+        sent["url"] = url
+        sent["payload"] = payload
+
+    text = digest.run_weekly_digest(invoke_fn=fake_invoke, post_fn=fake_post)
+
+    assert text == "weekly reflection's ready in journal/..."
+    # The weekly trigger drove the turn, not the daily one.
+    assert "weekly" in str(seen["user_message"]).lower()
+    assert sent["url"] == "https://api.telegram.org/bot999:XYZ/sendMessage"
+    assert sent["payload"]["chat_id"] == "5240954069"
+    assert sent["payload"]["text"] == "weekly reflection's ready in journal/..."
+
+
+def test_run_weekly_digest_reuses_send_telegram_message(tmp_path, monkeypatch) -> None:
+    """The weekly path must route its push through the shared
+    ``send_telegram_message`` helper — not a duplicated sender."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv("VAULT_ROOT", str(vault))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
+
+    calls: list[dict] = []
+
+    def spy_send(*, text, token, chat_id, post_fn):
+        calls.append({"text": text, "token": token, "chat_id": chat_id})
+
+    monkeypatch.setattr(digest, "send_telegram_message", spy_send)
+
+    digest.run_weekly_digest(
+        invoke_fn=lambda *_a, **_k: ("nudge", 1, 1, ()),
+        post_fn=lambda _u, _p: None,
+    )
+
+    assert calls == [{"text": "nudge", "token": "t", "chat_id": "c"}]
+
+
+def test_run_weekly_digest_requires_chat_id(tmp_path, monkeypatch) -> None:
+    """Missing ``TELEGRAM_CHAT_ID`` is a hard error for the weekly push
+    too — the nudge has no destination without it."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv("VAULT_ROOT", str(vault))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "999:XYZ")
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+    with pytest.raises(digest.DigestError, match="TELEGRAM_CHAT_ID"):
+        digest.run_weekly_digest(
+            invoke_fn=lambda *_a, **_k: ("x", 1, 1, ()),
+            post_fn=lambda _u, _p: None,
+        )
+
+
+# ---------------------------------------------------------------------------
 # main(): CLI exit codes — 0 on success, non-zero on failure
 # ---------------------------------------------------------------------------
 
@@ -216,3 +341,62 @@ def test_main_daily_returns_nonzero_on_digest_error(monkeypatch) -> None:
 
     monkeypatch.setattr(digest, "run_daily_digest", boom)
     assert digest.main(["--mode=daily"]) == 1
+
+
+def test_main_weekly_dispatches_to_run_weekly_digest(monkeypatch) -> None:
+    """``python -m agent.digest --mode=weekly`` runs ``run_weekly_digest``
+    (not the daily one) and exits 0 on success."""
+    called: list[str] = []
+
+    def fake_daily(**_kwargs):
+        called.append("daily")
+        return "daily"
+
+    def fake_weekly(**_kwargs):
+        called.append("weekly")
+        return "weekly nudge"
+
+    monkeypatch.setattr(digest, "run_daily_digest", fake_daily)
+    monkeypatch.setattr(digest, "run_weekly_digest", fake_weekly)
+
+    assert digest.main(["--mode=weekly"]) == 0
+    assert called == ["weekly"]
+
+
+def test_main_weekly_returns_nonzero_on_digest_error(monkeypatch) -> None:
+    """A ``DigestError`` on the weekly path makes the CLI exit non-zero so
+    launchd logs a visible failure."""
+
+    def boom(**_kwargs):
+        raise digest.DigestError("claude -p failed")
+
+    monkeypatch.setattr(digest, "run_weekly_digest", boom)
+    assert digest.main(["--mode=weekly"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# launchd plist: the weekly job fires --mode=weekly on Sundays at 06:00
+# ---------------------------------------------------------------------------
+
+
+def test_weekly_plist_fires_weekly_mode_on_sunday_at_six() -> None:
+    """``com.jason.personal-assistant.digest-weekly.plist`` schedules
+    ``python -m agent.digest --mode=weekly`` for Sundays (Weekday 0) at
+    06:00 — the weekly counterpart to the daily plist from #5."""
+    plist_path = (
+        _LAUNCHD_DIR / "com.jason.personal-assistant.digest-weekly.plist"
+    )
+    assert plist_path.exists(), f"missing weekly plist: {plist_path}"
+
+    with plist_path.open("rb") as handle:
+        plist = plistlib.load(handle)
+
+    assert plist["Label"] == "com.jason.personal-assistant.digest-weekly"
+    args = plist["ProgramArguments"]
+    assert args[-3:] == ["-m", "agent.digest", "--mode=weekly"]
+
+    interval = plist["StartCalendarInterval"]
+    assert interval["Hour"] == 6
+    assert interval["Minute"] == 0
+    # launchd Weekday: 0 (and 7) are Sunday.
+    assert interval["Weekday"] == 0

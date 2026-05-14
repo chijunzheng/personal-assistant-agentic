@@ -45,6 +45,7 @@ __all__ = [
     "generate_digest",
     "main",
     "run_daily_digest",
+    "run_weekly_digest",
     "send_telegram_message",
 ]
 
@@ -56,19 +57,38 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _PROMPTS_DIR = _REPO_ROOT / "prompts"
 
 # Map of ``--mode`` value -> the system-prompt file driving that digest.
-# ``daily`` is the only mode in this slice; the weekly reflection digest
-# (#6) registers ``weekly`` here without touching the rest of the module.
+# Both modes share ``prompts/digest.md`` — the file carries a daily
+# section and a weekly section; ``--mode`` selects which user message
+# (and so which section) the LLM acts on. Registering a mode here is the
+# whole wiring step: ``main`` and argparse ``choices`` read this map.
 _MODE_PROMPTS = {
     "daily": _PROMPTS_DIR / "digest.md",
+    "weekly": _PROMPTS_DIR / "digest.md",
 }
 
 # The user message handed to ``claude -p``. The *instructions* (what to
 # read, what to include, tone, rendering constraints) live entirely in
-# the system prompt; this is just the trigger.
+# the system prompt; this is just the trigger. Each mode gets a distinct
+# trigger so the LLM acts on the matching section of ``prompts/digest.md``
+# — and so daily vs weekly is distinguishable in the invocation.
 _DAILY_USER_MESSAGE = (
-    "Generate today's daily digest. Follow your system prompt: read the "
-    "vault, assemble the sections, and reply with the digest text only."
+    "Generate today's daily digest. Follow the daily-digest section of "
+    "your system prompt: read the vault, assemble the sections, and reply "
+    "with the digest text only."
 )
+
+_WEEKLY_USER_MESSAGE = (
+    "Generate this week's weekly reflection. Follow the weekly-reflection "
+    "section of your system prompt: review the last 7 days, Write the "
+    "reflection draft into journal/, and reply with the short Telegram "
+    "nudge text only."
+)
+
+# Map of ``--mode`` value -> the trigger message for that digest turn.
+_MODE_USER_MESSAGES = {
+    "daily": _DAILY_USER_MESSAGE,
+    "weekly": _WEEKLY_USER_MESSAGE,
+}
 
 _TELEGRAM_API_BASE = "https://api.telegram.org"
 _HTTP_TIMEOUT_SEC = 15
@@ -189,8 +209,16 @@ def generate_digest(
     system_prompt = prompt_path.read_text(encoding="utf-8")
 
     try:
+        user_message = _MODE_USER_MESSAGES[mode]
+    except KeyError:
+        raise DigestError(
+            f"unknown digest mode {mode!r}; expected one of "
+            f"{sorted(_MODE_USER_MESSAGES)}"
+        ) from None
+
+    try:
         reply, _tokens_in, _tokens_out, _tool_calls = invoke_fn(
-            _DAILY_USER_MESSAGE,
+            user_message,
             cwd=vault_root,
             system_prompt=system_prompt,
         )
@@ -214,17 +242,19 @@ def _require_env(name: str) -> str:
     return value
 
 
-def run_daily_digest(
+def _run_digest(
     *,
-    invoke_fn: Callable[..., tuple] = invoke_claude,
-    post_fn: PostFn = _http_post_json,
+    mode: str,
+    invoke_fn: Callable[..., tuple],
+    post_fn: PostFn,
 ) -> str:
-    """Generate the daily digest and push it to Telegram. Returns the text.
+    """Shared run path: resolve env, generate via ``claude -p``, push.
 
-    Reads ``VAULT_ROOT``, ``TELEGRAM_BOT_TOKEN``, ``TELEGRAM_CHAT_ID``
-    from the environment. Any failure raises ``DigestError`` so the
-    process exits non-zero — a scheduled job that fails silently is worse
-    than one that fails loudly in the launchd log.
+    Both ``run_daily_digest`` and ``run_weekly_digest`` are thin wrappers
+    over this — the only difference between them is ``mode``. Any failure
+    raises ``DigestError`` so the scheduled process exits non-zero — a
+    job that fails silently is worse than one that fails loudly in the
+    launchd log.
     """
     vault_raw = _require_env("VAULT_ROOT")
     vault_root = Path(vault_raw).expanduser()
@@ -235,13 +265,45 @@ def run_daily_digest(
     chat_id = _require_env("TELEGRAM_CHAT_ID")
 
     digest_text = generate_digest(
-        mode="daily", vault_root=vault_root, invoke_fn=invoke_fn
+        mode=mode, vault_root=vault_root, invoke_fn=invoke_fn
     )
     send_telegram_message(
         text=digest_text, token=token, chat_id=chat_id, post_fn=post_fn
     )
-    logger.info("daily digest sent (%d chars)", len(digest_text))
+    logger.info("%s digest sent (%d chars)", mode, len(digest_text))
     return digest_text
+
+
+def run_daily_digest(
+    *,
+    invoke_fn: Callable[..., tuple] = invoke_claude,
+    post_fn: PostFn = _http_post_json,
+) -> str:
+    """Generate the daily digest and push it to Telegram. Returns the text.
+
+    Reads ``VAULT_ROOT``, ``TELEGRAM_BOT_TOKEN``, ``TELEGRAM_CHAT_ID``
+    from the environment.
+    """
+    return _run_digest(mode="daily", invoke_fn=invoke_fn, post_fn=post_fn)
+
+
+def run_weekly_digest(
+    *,
+    invoke_fn: Callable[..., tuple] = invoke_claude,
+    post_fn: PostFn = _http_post_json,
+) -> str:
+    """Generate the weekly reflection and push the nudge to Telegram.
+
+    Unlike the daily digest (a fire-and-forget push), the weekly turn is
+    reflection-oriented: ``claude -p`` reviews the last 7 days and *Writes*
+    a ``journal/YYYY-MM-DD-weekly-reflection.md`` draft itself (it has
+    Write access), then replies with a short nudge. This function stays
+    thin — it only selects the weekly mode and pushes the nudge text; the
+    draft authoring is entirely the LLM's, instructed in
+    ``prompts/digest.md``. Reuses ``send_telegram_message`` via
+    ``_run_digest`` — the push helper is not duplicated.
+    """
+    return _run_digest(mode="weekly", invoke_fn=invoke_fn, post_fn=post_fn)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -272,18 +334,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.mode == "daily":
-        try:
-            run_daily_digest()
-        except DigestError:
-            logger.exception("daily digest failed")
-            return 1
-        return 0
+    # Each registered mode maps to its run function. argparse's ``choices``
+    # already rejects anything outside ``_MODE_PROMPTS``; this map is the
+    # mode -> handler wiring.
+    handlers: dict[str, Callable[[], str]] = {
+        "daily": run_daily_digest,
+        "weekly": run_weekly_digest,
+    }
 
-    # Unreachable while ``daily`` is the only registered mode — argparse's
-    # ``choices`` rejects anything else. Kept explicit for #6 (weekly).
-    logger.error("mode %r has no handler", args.mode)
-    return 1
+    handler = handlers.get(args.mode)
+    if handler is None:
+        # Unreachable while every registered mode has a handler — argparse
+        # rejects unknown modes. Kept explicit as a guard.
+        logger.error("mode %r has no handler", args.mode)
+        return 1
+
+    try:
+        handler()
+    except DigestError:
+        logger.exception("%s digest failed", args.mode)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
