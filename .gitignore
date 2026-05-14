@@ -7,3 +7,6 @@ __pycache__/
 *.tmp
 *.log
 logs/
+
+# Memory is personal data — it lives only in the Obsidian vault, never the repo.
+memory/
