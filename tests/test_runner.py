@@ -31,7 +31,8 @@ def test_argv_includes_allowed_tools_and_system_prompt() -> None:
     assert argv[0] == "claude"
     assert "-p" in argv
     assert "--output-format" in argv
-    assert "json" in argv
+    assert "stream-json" in argv
+    assert "--verbose" in argv
 
     i = argv.index("--allowed-tools")
     assert argv[i + 1] == "Read,Write"
@@ -72,7 +73,8 @@ def test_argv_omits_allowed_tools_when_empty() -> None:
 
 
 def _stream(events: list[dict]) -> str:
-    return json.dumps(events)
+    """Render events as JSONL — the shape ``--output-format stream-json`` emits."""
+    return "\n".join(json.dumps(e) for e in events)
 
 
 def test_parse_extracts_final_reply_and_usage() -> None:
@@ -153,9 +155,20 @@ def test_parse_raises_on_invalid_json() -> None:
         runner._parse_envelope("not json")
 
 
-def test_parse_raises_on_wrong_envelope_type() -> None:
-    with pytest.raises(runner.ClaudeRunnerError, match="unexpected"):
-        runner._parse_envelope('{"type": "result", "result": "x"}')
+def test_parse_raises_on_empty_output() -> None:
+    with pytest.raises(runner.ClaudeRunnerError, match="no output"):
+        runner._parse_envelope("   \n  ")
+
+
+def test_parse_raises_when_no_result_event() -> None:
+    envelope = _stream(
+        [
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"content": []}},
+        ]
+    )
+    with pytest.raises(runner.ClaudeRunnerError, match="no result event"):
+        runner._parse_envelope(envelope)
 
 
 # ---------------------------------------------------------------------------

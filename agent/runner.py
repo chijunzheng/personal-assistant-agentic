@@ -186,7 +186,16 @@ def _build_argv(
     allowed_tools: Sequence[str],
     system_prompt: str | None,
 ) -> list[str]:
-    argv: list[str] = [binary, "-p", "--output-format", "json"]
+    # stream-json (not plain json): plain json collapses the run to a single
+    # result object with no tool_use trail, which the audit log needs. The
+    # CLI requires --verbose alongside --output-format stream-json.
+    argv: list[str] = [
+        binary,
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ]
     if allowed_tools:
         argv.extend(["--allowed-tools", ",".join(allowed_tools)])
     if system_prompt:
@@ -264,9 +273,9 @@ def invoke_claude(
 def _parse_envelope(
     raw_stdout: str,
 ) -> tuple[str, int, int, tuple[Mapping[str, Any], ...]]:
-    """Decode ``claude -p --output-format json`` output.
+    """Decode ``claude -p --output-format stream-json`` output.
 
-    Output is a JSON array of stream events:
+    Output is JSONL — one JSON object per line, one per stream event:
       * ``{"type": "system", ...}`` — startup / config
       * ``{"type": "assistant", "message": {"content": [...], "usage": {...}}}``
         — each LLM turn; ``content`` may include ``text`` blocks and
@@ -280,24 +289,26 @@ def _parse_envelope(
     from the same event, and collect every ``tool_use`` block across all
     assistant events for the audit log.
     """
-    try:
-        payload = json.loads(raw_stdout)
-    except json.JSONDecodeError as err:
-        raise ClaudeRunnerError(
-            f"could not parse claude -p JSON envelope: {err}"
-        ) from err
+    lines = [ln for ln in raw_stdout.splitlines() if ln.strip()]
+    if not lines:
+        raise ClaudeRunnerError("claude -p produced no output")
 
-    if not isinstance(payload, list):
-        raise ClaudeRunnerError(
-            f"unexpected claude -p envelope type: {type(payload).__name__}"
-        )
+    events: list[Any] = []
+    for line in lines:
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError as err:
+            raise ClaudeRunnerError(
+                f"could not parse claude -p JSONL line: {err}"
+            ) from err
 
     reply = ""
     tokens_in = 0
     tokens_out = 0
     tool_calls: list[Mapping[str, Any]] = []
+    saw_result = False
 
-    for event in payload:
+    for event in events:
         if not isinstance(event, dict):
             continue
         etype = event.get("type")
@@ -313,10 +324,14 @@ def _parse_envelope(
                         }
                     )
         elif etype == "result":
+            saw_result = True
             reply = str(event.get("result") or "")
             usage = event.get("usage") or {}
             tokens_in = int(usage.get("input_tokens", 0) or 0)
             tokens_out = int(usage.get("output_tokens", 0) or 0)
+
+    if not saw_result:
+        raise ClaudeRunnerError("claude -p stream had no result event")
 
     return reply, tokens_in, tokens_out, tuple(tool_calls)
 
