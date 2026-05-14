@@ -7,9 +7,11 @@ no incoming message. It is a scheduled *push*.
 
 So this module needs two things the reply path doesn't:
 
-  1. A standalone entrypoint (``python -m agent.digest --mode=daily``),
-     invoked by launchd at 06:00 — see
-     ``infra/launchd/com.jason.personal-assistant.digest-daily.plist``.
+  1. ``run_daily_digest`` / ``run_weekly_digest`` — the digest *logic*,
+     scheduled in-process by the Telegram bridge's PTB ``JobQueue`` (see
+     ``agent/telegram_bridge.py:register_digest_jobs`` and ADR 0003). The
+     ``python -m agent.digest --mode=daily|weekly`` CLI entrypoint stays
+     as the manual smoke-test path.
   2. An outbound send primitive that POSTs straight to the Telegram Bot
      API ``sendMessage`` endpoint, addressed by ``TELEGRAM_CHAT_ID``,
      because there is no ``Message`` object to reply against.
@@ -21,8 +23,9 @@ three days of ``journal/``) and produce the digest text. This module
 does NOT parse ``reminders.jsonl`` itself — the content sourcing is
 *instructed* in ``prompts/digest.md``.
 
-See ``docs/adr/0002-proactive-digest-modality.md`` for why launchd + a
-standalone entrypoint rather than an in-process scheduler.
+See ``docs/adr/0002-proactive-digest-modality.md`` for the proactive-push
+modality, and ``docs/adr/0003-in-process-digest-scheduling.md`` for why
+the trigger is the bridge's in-process scheduler rather than launchd.
 """
 
 from __future__ import annotations
@@ -252,9 +255,9 @@ def _run_digest(
 
     Both ``run_daily_digest`` and ``run_weekly_digest`` are thin wrappers
     over this — the only difference between them is ``mode``. Any failure
-    raises ``DigestError`` so the scheduled process exits non-zero — a
-    job that fails silently is worse than one that fails loudly in the
-    launchd log.
+    raises ``DigestError``: the in-process job callback logs it loudly and
+    the CLI exits non-zero — a job that fails silently is worse than one
+    that fails visibly.
     """
     vault_raw = _require_env("VAULT_ROOT")
     vault_root = Path(vault_raw).expanduser()
@@ -309,8 +312,9 @@ def run_weekly_digest(
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint: ``python -m agent.digest --mode=daily``.
 
-    Returns 0 on success, non-zero on any failure (and logs the error).
-    A non-zero exit surfaces in the launchd log so a broken digest is
+    This is the manual smoke-test path — the production trigger is the
+    bridge's in-process ``JobQueue`` (ADR 0003). Returns 0 on success,
+    non-zero on any failure (and logs the error) so a broken digest is
     visible rather than silently skipped.
     """
     try:

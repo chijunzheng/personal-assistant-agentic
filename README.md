@@ -48,7 +48,6 @@ No classifier. No retrieval module. No domain plugins. Claude picks what to read
 | `agent/telegram_bridge.py` | python-telegram-bot polling loop (ported from v1) |
 | `prompts/system.md` | The contract Claude reads every turn (vault layout, naming, mtime buffer rule, idempotency rule) |
 | `eval/` | Head-to-head harness (placeholder; methodology rebuilt for agentic) |
-| `infra/launchd/` | macOS launchd plists for bot keep-alive, etc. (ported later) |
 
 ## Quickstart
 

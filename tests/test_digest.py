@@ -4,21 +4,16 @@ These never hit the network or spawn ``claude -p``. The Telegram POST and
 the ``claude -p`` subprocess are both injected so the tests are honest
 unit tests: they pin the *invocation shape*, not live behavior.
 
-End-to-end behavior is covered by the launchd smoke test documented in
-``infra/launchd/README.md`` (``launchctl start ...``).
+The production trigger is in-process (PTB ``JobQueue``, see ADR 0003) —
+job registration is covered in ``tests/test_telegram_bridge.py``. Manual
+end-to-end smoke testing uses the CLI: ``python -m agent.digest --mode=daily``.
 """
 
 from __future__ import annotations
 
-import plistlib
-from pathlib import Path
-
 import pytest
 
 from agent import digest
-
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-_LAUNCHD_DIR = _REPO_ROOT / "infra" / "launchd"
 
 
 # ---------------------------------------------------------------------------
@@ -333,8 +328,8 @@ def test_main_daily_returns_zero_on_success(monkeypatch) -> None:
 
 def test_main_daily_returns_nonzero_on_digest_error(monkeypatch) -> None:
     """A ``DigestError`` (claude failure, network failure, missing env)
-    makes the CLI exit non-zero so launchd logs a visible failure rather
-    than a silent skip."""
+    makes the CLI exit non-zero so a manual smoke-test run surfaces the
+    failure visibly rather than as a silent skip."""
 
     def boom(**_kwargs):
         raise digest.DigestError("claude -p failed")
@@ -365,38 +360,10 @@ def test_main_weekly_dispatches_to_run_weekly_digest(monkeypatch) -> None:
 
 def test_main_weekly_returns_nonzero_on_digest_error(monkeypatch) -> None:
     """A ``DigestError`` on the weekly path makes the CLI exit non-zero so
-    launchd logs a visible failure."""
+    a manual smoke-test run surfaces the failure visibly."""
 
     def boom(**_kwargs):
         raise digest.DigestError("claude -p failed")
 
     monkeypatch.setattr(digest, "run_weekly_digest", boom)
     assert digest.main(["--mode=weekly"]) == 1
-
-
-# ---------------------------------------------------------------------------
-# launchd plist: the weekly job fires --mode=weekly on Sundays at 06:00
-# ---------------------------------------------------------------------------
-
-
-def test_weekly_plist_fires_weekly_mode_on_sunday_at_six() -> None:
-    """``com.jason.personal-assistant.digest-weekly.plist`` schedules
-    ``python -m agent.digest --mode=weekly`` for Sundays (Weekday 0) at
-    06:00 — the weekly counterpart to the daily plist from #5."""
-    plist_path = (
-        _LAUNCHD_DIR / "com.jason.personal-assistant.digest-weekly.plist"
-    )
-    assert plist_path.exists(), f"missing weekly plist: {plist_path}"
-
-    with plist_path.open("rb") as handle:
-        plist = plistlib.load(handle)
-
-    assert plist["Label"] == "com.jason.personal-assistant.digest-weekly"
-    args = plist["ProgramArguments"]
-    assert args[-3:] == ["-m", "agent.digest", "--mode=weekly"]
-
-    interval = plist["StartCalendarInterval"]
-    assert interval["Hour"] == 6
-    assert interval["Minute"] == 0
-    # launchd Weekday: 0 (and 7) are Sunday.
-    assert interval["Weekday"] == 0

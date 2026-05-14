@@ -1,5 +1,7 @@
 # ADR 0002: Proactive digest output modality (scheduled push, not reply)
 
+> **Superseded in part by [ADR 0003](0003-in-process-digest-scheduling.md) (scheduling mechanism).** The proactive-push output modality below still stands; only the launchd trigger is replaced by an in-process PTB `JobQueue`.
+
 **Status:** Accepted
 **Date:** 2026-05-14
 **Issue:** [#5](https://github.com/chijunzheng/personal-assistant-agentic/issues/5)

@@ -11,6 +11,7 @@ Verifies that the PTB-style handler:
 
 from __future__ import annotations
 
+import datetime as dt
 import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -429,3 +430,152 @@ def test_build_application_registers_text_and_attachment_handlers(
     assert "TEXT" in joined or "text" in joined.lower()
     # Another covers Document/Photo (new behavior).
     assert "Document" in joined or "PHOTO" in joined or "photo" in joined.lower()
+
+
+# ---------------------------------------------------------------------------
+# In-process digest scheduling — JobQueue jobs registered at startup (#9)
+# ---------------------------------------------------------------------------
+
+
+class _FakeJobQueue:
+    """Records ``run_daily`` calls without touching APScheduler.
+
+    PTB's real ``JobQueue.run_daily`` needs a running event loop and an
+    initialized application; for registration tests we only care that the
+    bridge asked for the right schedules, so we capture the calls.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def run_daily(self, callback, time, days=(0, 1, 2, 3, 4, 5, 6), name=None):
+        self.calls.append(
+            {"callback": callback, "time": time, "days": tuple(days), "name": name}
+        )
+        return MagicMock()
+
+
+def test_register_digest_jobs_schedules_daily_and_weekly() -> None:
+    """``register_digest_jobs`` registers exactly two recurring jobs:
+    a daily digest at 06:00 local time (every day) and a weekly digest at
+    06:00 local time on Sundays only (PTB day index 0)."""
+    jq = _FakeJobQueue()
+
+    telegram_bridge.register_digest_jobs(jq)
+
+    assert len(jq.calls) == 2
+
+    by_name = {c["name"]: c for c in jq.calls}
+    assert set(by_name) == {"digest-daily", "digest-weekly"}
+
+    daily = by_name["digest-daily"]
+    assert daily["time"].hour == 6
+    assert daily["time"].minute == 0
+    # Every day of the week.
+    assert daily["days"] == (0, 1, 2, 3, 4, 5, 6)
+
+    weekly = by_name["digest-weekly"]
+    assert weekly["time"].hour == 6
+    assert weekly["time"].minute == 0
+    # PTB 21: 0-6 == Sunday-Saturday, so Sunday-only is (0,).
+    assert weekly["days"] == (0,)
+
+
+def test_register_digest_jobs_uses_tz_aware_local_times() -> None:
+    """The 06:00 schedules must be timezone-aware (the host's local tz),
+    not naive — a naive time would be interpreted as UTC by PTB and fire
+    at the wrong wall-clock hour."""
+    jq = _FakeJobQueue()
+
+    telegram_bridge.register_digest_jobs(jq)
+
+    for call in jq.calls:
+        scheduled = call["time"]
+        assert isinstance(scheduled, dt.time)
+        assert scheduled.tzinfo is not None, "digest schedule time must be tz-aware"
+
+
+@pytest.mark.asyncio
+async def test_digest_callback_dispatches_to_run_fn() -> None:
+    """The job callback invokes the wrapped digest run function exactly
+    once. The run function is the *existing* ``run_daily_digest`` /
+    ``run_weekly_digest`` — digest logic is not reimplemented in the
+    bridge."""
+    calls: list[str] = []
+
+    def fake_run() -> str:
+        calls.append("ran")
+        return "digest text"
+
+    callback = telegram_bridge.make_digest_callback(fake_run)
+    await callback(MagicMock())
+
+    assert calls == ["ran"]
+
+
+@pytest.mark.asyncio
+async def test_digest_callback_swallows_failure() -> None:
+    """A failing digest run must not propagate out of the callback — an
+    uncaught exception in a PTB job would otherwise be logged loudly but
+    the callback contract is that the bot keeps polling regardless."""
+    def boom() -> str:
+        raise RuntimeError("claude -p failed")
+
+    callback = telegram_bridge.make_digest_callback(boom)
+
+    # Must not raise.
+    await callback(MagicMock())
+
+
+def test_register_digest_jobs_wires_correct_digest_functions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``digest-daily`` dispatches to ``run_daily_digest`` and
+    ``digest-weekly`` to ``run_weekly_digest`` — not the other way round,
+    and not a reimplementation."""
+    import agent.digest as digest_mod
+
+    daily_calls: list[str] = []
+    weekly_calls: list[str] = []
+    monkeypatch.setattr(
+        digest_mod, "run_daily_digest", lambda: daily_calls.append("d") or "d"
+    )
+    monkeypatch.setattr(
+        digest_mod, "run_weekly_digest", lambda: weekly_calls.append("w") or "w"
+    )
+
+    jq = _FakeJobQueue()
+    telegram_bridge.register_digest_jobs(jq)
+
+    by_name = {c["name"]: c for c in jq.calls}
+
+    import asyncio
+
+    asyncio.run(by_name["digest-daily"]["callback"](MagicMock()))
+    assert daily_calls == ["d"] and weekly_calls == []
+
+    asyncio.run(by_name["digest-weekly"]["callback"](MagicMock()))
+    assert daily_calls == ["d"] and weekly_calls == ["w"]
+
+
+def test_build_application_registers_digest_jobs_on_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``build_application`` wires the two digest jobs onto the
+    application's JobQueue at construction time — so simply starting the
+    bot is enough; there is no separate launchd step (#9)."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token-for-test")
+    monkeypatch.setenv("VAULT_ROOT", str(tmp_path))
+
+    async def _text_reply(_chat_id: str, _text: str) -> str:
+        return "ok"
+
+    app = telegram_bridge.build_application(reply_fn=_text_reply)
+
+    assert app.job_queue is not None, "JobQueue must be available (job-queue extra)"
+    jobs = app.job_queue.jobs()
+    job_names = {job.name for job in jobs}
+    assert "digest-daily" in job_names
+    assert "digest-weekly" in job_names
+    assert len(jobs) == 2

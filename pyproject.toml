@@ -11,7 +11,9 @@ readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Jason Chi" }]
 dependencies = [
-  "python-telegram-bot ~= 21.0",
+  # [job-queue] pulls APScheduler — required for the in-process digest
+  # scheduler registered in agent/telegram_bridge.py (see ADR 0003).
+  "python-telegram-bot[job-queue] ~= 21.0",
   "pyyaml >= 6.0, < 7.0",
   "pydantic ~= 2.0",
   "tenacity >= 8.0, < 10.0",
