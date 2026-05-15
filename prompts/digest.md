@@ -20,8 +20,13 @@ If the trigger says "daily digest", do the daily section and ignore the weekly s
 ├── journal/             # narrative markdown — one .md per day
 ├── memory/              # durable facts about Jason; topic files + MEMORY.md index
 ├── reminder/
-│   └── reminders.jsonl  # source of truth: append-only event log of reminders
+│   ├── reminders.jsonl  # source of truth: append-only event log of reminders
+│   └── reminders.md     # generated Obsidian view — do not read for the digest
 ├── fitness/  finance/  inventory/   # structured event logs — not your concern today
+│   └── (each domain also has generated .md views, e.g. finance/YYYY-MM.md,
+│        inventory/state.md — these are projections of the canonical .jsonl/.yaml
+│        and must not be read as digest input; query the canonical files directly
+│        if you ever need a domain stat)
 └── _audit/ _index/ _chat_log/       # kernel-managed — do not read for the digest
 ```
 
