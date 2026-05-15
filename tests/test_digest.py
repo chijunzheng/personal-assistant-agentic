@@ -626,3 +626,205 @@ def test_daily_digest_anniversary_and_rogers_use_case_is_documented() -> None:
     assert "due" in lowered
     # Sorting rule is explicit so the LLM doesn't reorder by salience.
     assert "sort" in lowered or "order" in lowered
+
+
+# ---------------------------------------------------------------------------
+# Weekly reflection prompt rewrite (issue #23) — substantive Telegram nudge
+# and richer think-on-paper draft. Like the daily tests above, these pin the
+# *contract* in ``prompts/digest.md`` rather than live LLM behavior; the
+# system prompt is the LLM's public API and the assertions encode the new
+# section names, rollup scope, escalation language, and quality-bar rules.
+# ---------------------------------------------------------------------------
+
+
+def _read_weekly_section() -> str:
+    """Return just the weekly-reflection section of ``prompts/digest.md``.
+
+    Mirrors ``_read_daily_section``. The slice is bounded by the
+    ``# Weekly reflection`` heading above and the ``# Telegram rendering
+    constraints`` footer below so weekly assertions cannot accidentally
+    pass on text living under the daily section.
+    """
+    path = digest.build_digest_argv_prompt_path("weekly")
+    text = path.read_text(encoding="utf-8")
+    weekly_start = text.index("# Weekly reflection")
+    footer_start = text.index("# Telegram rendering constraints", weekly_start)
+    return text[weekly_start:footer_start]
+
+
+def test_weekly_user_message_steers_toward_substantive_nudge() -> None:
+    """The trigger handed to ``claude -p`` must steer the LLM toward a
+    *substantive* week-in-review nudge — not a bare "draft is ready"
+    pointer. Issue #23: the nudge has to stand alone on a busy Sunday
+    morning. Pinning the trigger here protects against a future edit that
+    quietly downgrades the ask back to "reply with the short nudge only"."""
+    message = digest._MODE_USER_MESSAGES["weekly"].lower()
+    # Names the turn shape (weekly + reflection).
+    assert "weekly" in message
+    assert "reflection" in message
+    # Names the draft-file deliverable so the LLM still Writes the draft.
+    assert "journal" in message
+    # Names the substantive-nudge dimension — week-in-review content beyond
+    # a pointer. A future edit that drops this signal will fail here.
+    assert (
+        "week-in-review" in message
+        or "week in review" in message
+        or "rollup" in message
+        or "substantive" in message
+    )
+
+
+def test_weekly_prompt_requires_substantive_nudge_not_pointer() -> None:
+    """Issue #23 acceptance criterion: 'Telegram nudge becomes substantive.'
+    The weekly section must say so explicitly so the LLM doesn't fall back
+    to the old one-line pointer."""
+    section = _read_weekly_section().lower()
+    assert "substantive" in section
+    # The week-in-review framing names the rollup shape, not just "summary".
+    assert "week-in-review" in section or "week in review" in section
+
+
+def test_weekly_prompt_nudge_rolls_up_across_domains() -> None:
+    """Issue #23 acceptance criterion: rollups across workouts, meals,
+    finance notable items, memory file diffs, decisions in journal. The
+    weekly section must name each rollup source so the LLM knows *where*
+    to look — not just that rollups exist."""
+    section = _read_weekly_section()
+    lowered = section.lower()
+    # Domains the nudge must touch.
+    assert "fitness" in lowered or "workouts" in lowered
+    assert "finance" in lowered
+    assert "memory" in lowered
+    # Decisions logged in journal are part of the rollup signal — they're
+    # the *why* of the week, distinct from the structured event logs.
+    assert "decision" in lowered
+    # Reminders carry over the open-thread signal.
+    assert "reminder" in lowered
+
+
+def test_weekly_prompt_open_threads_use_age_escalated_language() -> None:
+    """Issue #23 acceptance criterion: 'Open threads with age-escalated
+    language (same persistence rule as daily).' A thread open for weeks
+    must read differently from one open a few days. The prompt must name
+    the persistence rule for the weekly turn, not assume it carries
+    silently from the daily section."""
+    section = _read_weekly_section().lower()
+    # 'Open threads' (or 'loose threads') is named.
+    assert "open thread" in section or "loose thread" in section
+    # Age-escalation language — at least one signal of time-aware framing.
+    assert (
+        "persistence" in section
+        or "age-escalat" in section
+        or "age escalat" in section
+        or "how long" in section
+        or "days overdue" in section
+    )
+
+
+def test_weekly_prompt_keeps_pointer_to_draft_file() -> None:
+    """Issue #23 acceptance criterion: 'Short pointer to the draft file.'
+    The substantive content leads; the file pointer is the bridge into
+    Obsidian where the think-on-paper work happens. The nudge must still
+    name the draft path so Jason knows where to go."""
+    section = _read_weekly_section()
+    # Names the draft filename shape.
+    assert "weekly-reflection.md" in section
+    # And calls out that the nudge points at it.
+    lowered = section.lower()
+    assert "point" in lowered and "file" in lowered
+
+
+def test_weekly_prompt_raises_draft_prompt_count_to_four_to_six() -> None:
+    """Issue #23 acceptance criterion: 4-6 event-grounded prompts (up from
+    the previous 2-4). The new range must be present and the old range
+    gone — otherwise the LLM sees two conflicting counts."""
+    section = _read_weekly_section()
+    # The new 4-6 range (ASCII hyphen or unicode en-dash, plus spelled
+    # variants).
+    assert (
+        "4-6" in section
+        or "4–6" in section
+        or "4 to 6" in section
+        or "four to six" in section
+    )
+    # The old 2-4 range is gone.
+    assert "2-4" not in section
+    assert "2–4" not in section
+    assert "2 to 4" not in section
+
+
+def test_weekly_prompt_requires_inline_rollups_in_draft() -> None:
+    """Issue #23 acceptance criterion: 'Domain rollups inline at the top of
+    the draft (fitness summary, finance summary, memory changes this week).'
+    The draft is no longer prompts-only — it leads with rollups that turn
+    the file into a real think-on-paper artifact."""
+    section = _read_weekly_section().lower()
+    # The draft contract names inline rollups / summaries at the top.
+    assert "inline" in section or "rollup" in section or "summary" in section
+    # And calls out fitness / finance / memory as rollup scopes (the same
+    # domains the nudge rolls up — the draft mirrors the nudge so Jason can
+    # dive in on whichever rollup item prompts him).
+    assert "fitness" in section
+    assert "finance" in section
+    assert "memory" in section
+
+
+def test_weekly_prompt_surfaces_cross_week_patterns() -> None:
+    """Issue #23 acceptance criterion: 'Surfaces patterns across the week
+    (e.g. "4 wake misses in 5 days — what's the next experiment?").' The
+    weekly turn is where one-off events become patterns — the prompt must
+    name pattern-surfacing as part of the draft, not just per-day notes."""
+    section = _read_weekly_section().lower()
+    assert "pattern" in section
+
+
+def test_weekly_prompt_retains_event_grounded_quality_bar() -> None:
+    """Issue #23 acceptance criterion: '"Could only have been written for
+    this week" test still applies — no generic filler.' This is the
+    quality bar that distinguishes a real prompt ("you pushed the
+    Henderson proposal to Thursday twice — what kept getting in the way?")
+    from motivational filler ("how did you grow this week?")."""
+    section = _read_weekly_section().lower()
+    assert (
+        "could only have been written for" in section
+        or "only have been written for this week" in section
+    )
+    # And the generic-filler counter-examples are still warned against.
+    assert "generic" in section or "filler" in section
+
+
+def test_weekly_prompt_retains_safety_rules() -> None:
+    """Issue #23 acceptance criterion: existing safety rules retained —
+    never overwrite an existing draft, never touch the daily entry, respect
+    the 30-min user-edit buffer, never read kernel-managed dirs."""
+    section = _read_weekly_section().lower()
+    # Never overwrite an existing reflection draft.
+    assert (
+        "never overwrite" in section
+        or "do not overwrite" in section
+        or "not overwrite" in section
+    )
+    # Never touch the daily entry on the same date.
+    assert "daily entry" in section or "journal/<today>.md" in section
+    # 30-minute user-edit buffer.
+    assert (
+        "30-minute" in section
+        or "30 minute" in section
+        or "30-min" in section
+    )
+    # Kernel-managed dirs are off-limits.
+    assert "_audit" in section
+    assert "_index" in section
+    assert "_chat_log" in section
+
+
+def test_weekly_prompt_keeps_tool_surface_unchanged() -> None:
+    """Issue #23 acceptance criterion: 'Tools unchanged: Read, Glob, Grep,
+    Edit, Write.' The rewrite must not silently add a tool (e.g. WebFetch,
+    Bash) — the weekly turn stays inside the vault-scoped tool set."""
+    section = _read_weekly_section()
+    for tool in ("Read", "Glob", "Grep", "Edit", "Write"):
+        assert tool in section, f"{tool} should be listed for the weekly turn"
+    # And no smuggled-in tools.
+    assert "WebFetch" not in section
+    assert "Bash" not in section
