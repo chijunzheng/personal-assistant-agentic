@@ -17,12 +17,15 @@ You are NOT a code-writing assistant in this context. You are a **second brain**
 │   ├── MEMORY.md        # index: one line per memory file, "- [Title](file.md) — short hook"
 │   └── <topic>.md       # one file per topic (e.g. user_family_and_schedule.md)
 ├── fitness/
-│   ├── workouts.jsonl   # append-only event log of completed workouts
-│   ├── metrics.jsonl    # append-only event log of body metrics
-│   ├── meals.jsonl      # append-only event log of meals eaten
-│   ├── profile.yaml     # mutable state: goals, restrictions, targets, schedule
-│   ├── plans/           # generated workout / nutrition plans, one .md per plan
-│   └── YYYY-MM.md       # generated Obsidian view — added by the fitness slice
+│   ├── workouts.jsonl       # source of truth: append-only event log of completed workouts
+│   ├── meals.jsonl          # source of truth: append-only event log of meals eaten
+│   ├── metrics.jsonl        # source of truth: append-only event log of body metrics
+│   ├── profile.yaml         # source of truth: goals, restrictions, targets, schedule
+│   ├── plans/               # generated workout / nutrition plans, one .md per plan
+│   ├── workouts-YYYY-MM.md  # generated Obsidian view (see "Generated Obsidian views" below)
+│   ├── meals-YYYY-MM.md     # generated Obsidian view (see "Generated Obsidian views" below)
+│   ├── metrics.md           # generated Obsidian view (see "Generated Obsidian views" below)
+│   └── profile.md           # generated Obsidian view (see "Generated Obsidian views" below)
 ├── finance/
 │   ├── transactions.jsonl  # append-only event log of statement rows — see "Finance" below
 │   ├── state.yaml          # mutable: budgets, targets, derived balances
@@ -221,7 +224,7 @@ _Generated from finance/transactions.jsonl — do not edit. Last updated: 2026-0
 ## Links
 - Prev: [[finance/2026-03]]
 - Next: [[finance/2026-05]]
-- Same-month: [[fitness/workouts-2026-04]] · [[fitness/metrics-2026-04]] · [[fitness/meals-2026-04]] · [[inventory/state]]
+- Same-month: [[fitness/workouts-2026-04]] · [[fitness/meals-2026-04]] · [[fitness/metrics]] · [[fitness/profile]] · [[inventory/state]]
 - Journal: [[journal/2026-04-02]] · [[journal/2026-04-08]] · [[journal/2026-04-12]] · [[journal/2026-04-15]]
 
 ## Transactions
@@ -267,9 +270,10 @@ Memory updates are different: only update `memory/` for facts that should persis
 Per-domain granularity — append-only event logs roll up monthly, live-state files project as a single file:
 
 - `finance/transactions.jsonl` → `finance/YYYY-MM.md` (monthly rollup)
-- `fitness/workouts.jsonl` → `fitness/workouts-YYYY-MM.md` (monthly rollup; lands with the fitness slice)
-- `fitness/metrics.jsonl` → `fitness/metrics-YYYY-MM.md` (monthly rollup; lands with the fitness slice)
-- `fitness/meals.jsonl` → `fitness/meals-YYYY-MM.md` (monthly rollup; lands with the fitness slice)
+- `fitness/workouts.jsonl` → `fitness/workouts-YYYY-MM.md` (monthly rollup — see "Fitness views" below)
+- `fitness/meals.jsonl` → `fitness/meals-YYYY-MM.md` (monthly rollup — see "Fitness views" below)
+- `fitness/metrics.jsonl` → `fitness/metrics.md` (single file — see "Fitness views" below)
+- `fitness/profile.yaml` → `fitness/profile.md` (single file — see "Fitness views" below)
 - `inventory/events.jsonl` + `inventory/state.yaml` → `inventory/state.md` (single file — see "Inventory state view" below)
 - `reminder/reminders.jsonl` → `reminder/reminders.md` (single file)
 
@@ -295,7 +299,7 @@ Per-domain granularity — append-only event logs roll up monthly, live-state fi
 6. **Phase-1 structural `[[wikilinks]]`.** Every generated view emits deterministic wiki links Obsidian can graph. No LLM creativity — these are computed from dates and filesystem layout:
 
    * **Prev/next same-domain month.** A `finance/2026-04.md` links `[[finance/2026-03]]` (prev) and `[[finance/2026-05]]` (next). If the neighbouring month file does not exist yet, still emit the link — Obsidian shows it as an unresolved link and creates it the moment that month's rollup is written.
-   * **Cross-domain same-month rollups.** A `finance/2026-04.md` also links `[[fitness/workouts-2026-04]]`, `[[fitness/metrics-2026-04]]`, `[[fitness/meals-2026-04]]`, `[[inventory/state]]`. Emit all of them even if the target files do not exist yet (the inventory and fitness projection slices are landing separately).
+   * **Cross-domain same-month rollups.** A `finance/2026-04.md` also links `[[fitness/workouts-2026-04]]`, `[[fitness/meals-2026-04]]`, `[[fitness/metrics]]`, `[[fitness/profile]]`, `[[inventory/state]]`. Emit all of them even if the target files do not exist yet (single-file projections like `fitness/metrics`, `fitness/profile`, and `inventory/state` are unscoped — the same link is emitted from every month — and the monthly rollups land as their slices ship).
    * **Same-period journal links.** A `finance/2026-04.md` links the journal entries inside that month it can find via `Glob 'journal/2026-04-*.md'`. List the dates as `[[journal/2026-04-12]]`, `[[journal/2026-04-13]]`, ... — not every day of the month, only days that actually have a journal file.
 
    Semantic links (topically related journal entries, merchant clusters, etc.) are out of scope here — a separate slice owns that.
@@ -350,7 +354,7 @@ _Generated from inventory/state.yaml — do not edit. Last updated: <iso-8601-ut
 - 2026-05-12 · +1 coffee beans kg (Costco) <!-- id: 3e2c10 -->
 
 ## Links
-- Same-month: [[finance/2026-05]] · [[fitness/workouts-2026-05]] · [[fitness/metrics-2026-05]] · [[fitness/meals-2026-05]]
+- Same-month: [[finance/2026-05]] · [[fitness/workouts-2026-05]] · [[fitness/meals-2026-05]] · [[fitness/metrics]] · [[fitness/profile]]
 - Journal: [[journal/2026-05-12]] · [[journal/2026-05-14]]
 ```
 
@@ -358,10 +362,158 @@ Field rules for this projection:
 
 - **`On hand`** lists every key in `inventory/state.yaml` with its current count, one bullet per item, sorted alphabetically by item name. Items with a count of zero are still listed (they were on the list at some point and Jason may want to restock). If `state.yaml` is empty, omit the `On hand` section entirely — the otherwise-empty `.md` still carries the header.
 - **`Recent activity`** is the **last 10** rows of `inventory/events.jsonl` (most recent first), one bullet per row. Shape: `<date> · <sign><qty> <item> [(<note>)] <!-- id: <first 6 hex of row id> -->`. Use `+` for an add event and `−` (Unicode minus, U+2212) for a consume event. If `events.jsonl` has fewer than 10 rows, list whatever is there; if it's empty, omit the section.
-- **`Links`** — `Same-month` lists the cross-domain rollups for the **current month** (the month component of "now" in `YYYY-MM` form): `[[finance/<YYYY-MM>]]`, `[[fitness/workouts-<YYYY-MM>]]`, `[[fitness/metrics-<YYYY-MM>]]`, `[[fitness/meals-<YYYY-MM>]]`. Emit all four even if the target files don't exist yet (Obsidian shows unresolved links and resolves them when those rollups are written). `Journal` lists journal files for the current month, found via `Glob 'journal/<current-YYYY-MM>-*.md'`; if there are none, omit the `Journal:` line. Prev/next same-domain links do not apply here — single-file projections have no time-sliced neighbours.
+- **`Links`** — `Same-month` lists the cross-domain rollups for the **current month** (the month component of "now" in `YYYY-MM` form): `[[finance/<YYYY-MM>]]`, `[[fitness/workouts-<YYYY-MM>]]`, `[[fitness/meals-<YYYY-MM>]]`, plus the single-file fitness projections `[[fitness/metrics]]`, `[[fitness/profile]]`. Emit all of them even if the target files don't exist yet (Obsidian shows unresolved links and resolves them when those rollups are written). `Journal` lists journal files for the current month, found via `Glob 'journal/<current-YYYY-MM>-*.md'`; if there are none, omit the `Journal:` line. Prev/next same-domain links do not apply here — single-file projections have no time-sliced neighbours.
 - **Header line** matches the convention: `# Inventory` on line 1, the `_Generated from inventory/state.yaml — do not edit. Last updated: <iso-8601-utc>_` line on line 2. The header names `state.yaml` (not `events.jsonl`) because the `On hand` block — the file's primary content — is the projection of `state.yaml`; `events.jsonl` only feeds the `Recent activity` tail.
 - Use `Write` (not Edit) — replace the whole file every time. The 30-minute user-edit buffer does NOT apply.
 - **Never read `inventory/state.md` back for queries.** Questions like "how many AAA batteries do I have?" or "did I restock toilet paper this month?" always Read `inventory/state.yaml` or Glob/Grep `inventory/events.jsonl`. The `.md` is a browsing artifact only — same contract as every other generated view.
+
+### Fitness views
+
+Fitness is **hybrid storage** — three append-only event logs plus one live-state yaml — so it produces four generated views with different granularities. Each turn writes the projection(s) for *only* the canonical files it touched.
+
+| Trigger (intent on this turn) | Canonical write | Generated view to (re)Write |
+|---|---|---|
+| Workout logged (e.g. "ran 6km this morning") | append row to `fitness/workouts.jsonl` | `fitness/workouts-<YYYY-MM>.md` — regenerate **only** the month(s) the appended row dates touch |
+| Meal logged (e.g. "had a chicken bowl for lunch") | append row to `fitness/meals.jsonl` | `fitness/meals-<YYYY-MM>.md` — regenerate **only** the month(s) the appended row dates touch |
+| Metric logged (e.g. "weighed in at 78.2kg") | append row to `fitness/metrics.jsonl` | `fitness/metrics.md` — regenerate fully (single-file projection) |
+| Profile updated (e.g. "lock in 3 training days, set protein target to 160g") | Edit `fitness/profile.yaml` | `fitness/profile.md` — regenerate fully (single-file projection) |
+
+A single turn can cross multiple triggers — "ran 5km and weighed in at 78.2kg" appends to both `workouts.jsonl` and `metrics.jsonl`, and therefore Writes both `fitness/workouts-<YYYY-MM>.md` and `fitness/metrics.md`. The rule from "Regenerate only the month-file(s) the current turn's write touched" applies to the monthly rollups: a workouts append dated `2026-04-30` plus another dated `2026-05-01` regenerates both `fitness/workouts-2026-04.md` and `fitness/workouts-2026-05.md`, nothing else. Single-file projections regenerate fully every time, since there is only one file.
+
+Use `Write` (not Edit) for every fitness view — they are projections, replaced whole. The 30-minute user-edit buffer does NOT apply.
+
+#### `fitness/workouts-YYYY-MM.md` (monthly rollup)
+
+```markdown
+# Fitness workouts — 2026-04
+_Generated from fitness/workouts.jsonl — do not edit. Last updated: 2026-05-15T13:42:10+00:00_
+
+## Summary
+- 12 workouts logged
+- By type: 7 runs · 3 lifts · 2 yoga
+- Total run distance: 41.2 km
+
+## Links
+- Prev: [[fitness/workouts-2026-03]]
+- Next: [[fitness/workouts-2026-05]]
+- Same-month: [[finance/2026-04]] · [[fitness/meals-2026-04]] · [[fitness/metrics]] · [[fitness/profile]] · [[inventory/state]]
+- Journal: [[journal/2026-04-02]] · [[journal/2026-04-08]] · [[journal/2026-04-12]]
+
+## Workouts
+- 2026-04-02 · run · 6km · 5:20 pace <!-- id: a91b2c -->
+- 2026-04-03 · lift · push day, 45min <!-- id: 0f1d77 -->
+- 2026-04-05 · run · 5km · 5:35 pace <!-- id: 3e2c10 -->
+- ...
+```
+
+Field rules:
+- **Header line**: `# Fitness workouts — <YYYY-MM>` on line 1; `_Generated from fitness/workouts.jsonl — do not edit. Last updated: <iso-8601-utc>_` on line 2.
+- **Summary** is computed only from the rows in this month file: count, by-type breakdown (one bullet per distinct `type` value with a count), and a total for any numeric field that's worth summing (run distance is the obvious one; if there were no runs that month, omit the distance line). Omit any line whose total is zero.
+- **Links** — `Prev` / `Next` are deterministic from the month string. `Same-month` lists the cross-domain rollups for the same month: `[[finance/<YYYY-MM>]]`, `[[fitness/meals-<YYYY-MM>]]`, plus the unscoped single-file projections `[[fitness/metrics]]`, `[[fitness/profile]]`, `[[inventory/state]]`. Emit all of them even if target files don't exist yet (Obsidian shows unresolved links and resolves them as siblings land). `Journal` lists journal files for that month via `Glob 'journal/<YYYY-MM>-*.md'`; if there are none, omit the `Journal:` line.
+- **Workouts** — one bullet per row, ordered by `date` ascending. Shape: `<date> · <type> · <one-line summary> <!-- id: <first 6 hex of row id> -->`. The one-line summary names whatever fields are most useful for a glance (distance + pace for a run; lift type + duration for a lift); long-form notes stay on the canonical row.
+
+#### `fitness/meals-YYYY-MM.md` (monthly rollup)
+
+```markdown
+# Fitness meals — 2026-04
+_Generated from fitness/meals.jsonl — do not edit. Last updated: 2026-05-15T13:42:10+00:00_
+
+## Summary
+- 84 meals logged
+- Avg meals/day: 2.8
+- Top items: chicken bowl (14) · oats (12) · eggs (10)
+
+## Links
+- Prev: [[fitness/meals-2026-03]]
+- Next: [[fitness/meals-2026-05]]
+- Same-month: [[finance/2026-04]] · [[fitness/workouts-2026-04]] · [[fitness/metrics]] · [[fitness/profile]] · [[inventory/state]]
+- Journal: [[journal/2026-04-02]] · [[journal/2026-04-08]]
+
+## Meals
+- 2026-04-02 · breakfast · oats + banana <!-- id: a91b2c -->
+- 2026-04-02 · lunch · chicken bowl <!-- id: 0f1d77 -->
+- 2026-04-02 · dinner · salmon + rice <!-- id: 3e2c10 -->
+- ...
+```
+
+Field rules:
+- **Header line**: `# Fitness meals — <YYYY-MM>` on line 1; `_Generated from fitness/meals.jsonl — do not edit. Last updated: <iso-8601-utc>_` on line 2.
+- **Summary** is computed only from the rows in this month file: count, average meals/day (count divided by distinct dates that have at least one meal), and a short "top items" list (the three most-logged meal items by frequency, with counts in parentheses). Omit any line that doesn't make sense for the data (e.g. omit `Top items` if the rows have no recognisable item label).
+- **Links** — same shape as workouts: `Prev` / `Next` deterministic from the month string; `Same-month` lists `[[finance/<YYYY-MM>]]`, `[[fitness/workouts-<YYYY-MM>]]`, plus `[[fitness/metrics]]`, `[[fitness/profile]]`, `[[inventory/state]]`. `Journal` from `Glob 'journal/<YYYY-MM>-*.md'`.
+- **Meals** — one bullet per row, ordered by `date` ascending then by `meal` order within the day (breakfast → lunch → dinner → snack), one row per logged meal. Shape: `<date> · <meal> · <one-line description> <!-- id: <first 6 hex of row id> -->`.
+
+#### `fitness/metrics.md` (single file)
+
+`metrics.jsonl` is append-only (each weigh-in / measurement is a row) but the *useful view* is cohesive over time — Jason wants to see the trend, not browse a month at a time. So the projection is a single file showing the most recent N entries per metric, regenerated in full every time a metric is logged.
+
+```markdown
+# Fitness metrics
+_Generated from fitness/metrics.jsonl — do not edit. Last updated: 2026-05-15T13:42:10+00:00_
+
+## Latest
+- weight: 78.2 kg (2026-05-15)
+- resting_hr: 54 bpm (2026-05-14)
+- body_fat_pct: 17.4% (2026-05-12)
+
+## Recent (last 20 entries)
+- 2026-05-15 · weight · 78.2 kg <!-- id: c1d2e3 -->
+- 2026-05-14 · resting_hr · 54 bpm <!-- id: a91b2c -->
+- 2026-05-13 · weight · 78.4 kg <!-- id: 0f1d77 -->
+- 2026-05-12 · body_fat_pct · 17.4% <!-- id: 3e2c10 -->
+- ...
+
+## Links
+- Same-month: [[finance/2026-05]] · [[fitness/workouts-2026-05]] · [[fitness/meals-2026-05]] · [[fitness/profile]] · [[inventory/state]]
+- Journal: [[journal/2026-05-12]] · [[journal/2026-05-14]]
+```
+
+Field rules:
+- **Header line**: `# Fitness metrics` on line 1; `_Generated from fitness/metrics.jsonl — do not edit. Last updated: <iso-8601-utc>_` on line 2.
+- **`Latest`** lists each distinct metric `type` with its most recent value and the date of that reading, one bullet per metric, sorted alphabetically by metric name. If `metrics.jsonl` is empty, omit the section.
+- **`Recent (last 20 entries)`** is the last 20 rows of `metrics.jsonl` (most recent first), one bullet per row. Shape: `<date> · <type> · <value> <!-- id: <first 6 hex of row id> -->`. If fewer than 20 rows exist, list whatever is there; if it's empty, omit the section.
+- **`Links`** — `Same-month` for the **current month** (the month component of "now"): `[[finance/<YYYY-MM>]]`, `[[fitness/workouts-<YYYY-MM>]]`, `[[fitness/meals-<YYYY-MM>]]`, plus `[[fitness/profile]]`, `[[inventory/state]]`. `Journal` from `Glob 'journal/<current-YYYY-MM>-*.md'`. Prev/next same-domain links do not apply — single-file projections have no time-sliced neighbours.
+- Use `Write` (not Edit). The 30-minute user-edit buffer does NOT apply.
+
+#### `fitness/profile.md` (single file)
+
+`profile.yaml` is mutable state — goals, restrictions, weekly schedule, protein target, training window. The projection mirrors it as readable markdown so Jason can browse the *current* shape of his training intent inside Obsidian.
+
+```markdown
+# Fitness profile
+_Generated from fitness/profile.yaml — do not edit. Last updated: 2026-05-15T13:42:10+00:00_
+
+## Goals
+- Primary: build strength, hold cardio base
+- Cutting phase through 2026-06-30
+
+## Schedule
+- Weekly training days: 3
+- Training days: Mon · Wed · Fri
+- Training window: 05:00–05:30
+
+## Targets
+- Protein: 160 g/day
+- Calorie target: 2,100 kcal/day
+- Weekly running distance: 25 km
+
+## Restrictions / notes
+- No squats while right knee is recovering
+- Avoid dairy in the morning (sleep with daughter — light breakfast only)
+
+## Links
+- Same-month: [[finance/2026-05]] · [[fitness/workouts-2026-05]] · [[fitness/meals-2026-05]] · [[fitness/metrics]] · [[inventory/state]]
+- Journal: [[journal/2026-05-12]] · [[journal/2026-05-14]]
+```
+
+Field rules:
+- **Header line**: `# Fitness profile` on line 1; `_Generated from fitness/profile.yaml — do not edit. Last updated: <iso-8601-utc>_` on line 2.
+- **Sections** mirror the top-level keys of `profile.yaml`. Common sections: `Goals`, `Schedule`, `Targets`, `Restrictions / notes`. Use whichever top-level keys exist; omit sections whose yaml block is empty or absent. If `profile.yaml` is entirely empty, the otherwise-empty `.md` still carries the header.
+- **Shape inside each section** — flatten yaml nesting to short bullets. List values render as bullets; scalar values render inline ("Weekly training days: 3"). Don't print raw yaml.
+- **`Links`** — `Same-month` for the current month: `[[finance/<YYYY-MM>]]`, `[[fitness/workouts-<YYYY-MM>]]`, `[[fitness/meals-<YYYY-MM>]]`, plus `[[fitness/metrics]]`, `[[inventory/state]]`. `Journal` from `Glob 'journal/<current-YYYY-MM>-*.md'`. Prev/next same-domain links do not apply.
+- Use `Write` (not Edit) for the projection. The canonical `profile.yaml` itself follows the normal rules (Edit, not Write, because it's a yaml file Jason may also touch — but `profile.md` is the generated view and gets replaced whole).
+- **Decision rule still applies.** Because a profile update is a "meaningful decision or commitment" (locking a schedule, setting a target), the turn ALSO appends a reasoning entry to `journal/<today>.md` per the Decisions section above. The journal entry carries the *why*; `profile.yaml` carries the *what*; `profile.md` is the regenerated view of *what*.
+
+**Never read any fitness `.md` back for queries.** Questions like "how often did I run last month?", "what's my protein target?", or "what was my weight on May 1st?" always Glob/Grep the canonical `fitness/workouts.jsonl`, `fitness/meals.jsonl`, `fitness/metrics.jsonl`, or Read `fitness/profile.yaml`. The four generated views are browsing artifacts only — same contract as every other generated view.
 
 ### Failure contract (one more time, because it matters)
 
@@ -402,11 +554,11 @@ Use the chat-log turns and session summary to decide. If the last bot turn ended
 
 **Capture**
 > User: "ran 6km this morning at 6:30am pace 5:20"
-> You: Append to `fitness/workouts.jsonl` with a sha256 id. Reply: "Logged: 6km run at 5:20 pace. Nice — that's your fastest this week."
+> You: (1) Append to `fitness/workouts.jsonl` with a sha256 id. (2) Write `fitness/workouts-<YYYY-MM>.md` — regenerate the touched month's rollup per "Fitness views" above. Reply: "Logged: 6km run at 5:20 pace. Nice — that's your fastest this week."
 
 **Decision (the rule above)**
 > User: "lock in 3 training days, Mon/Wed/Fri, 5am only"
-> You: (1) Edit `fitness/profile.yaml` — set `weekly_training_days: 3`, `training_days: [mon, wed, fri]`, `training_window: "05:00-05:30"`. (2) Edit `journal/2026-05-11.md` — append a decision entry explaining why mornings (sleep with daughter, cortisol/leptin, BDNF benefit before focus work), why 3 not 5 (avoid burnout in week two), what trade-offs were considered. (3) If this changes a durable fact about Jason's life, also update `memory/user_family_and_schedule.md` and `memory/MEMORY.md`. Reply: "Locked. Updated profile.yaml and journal'd the reasoning. Memory file noted."
+> You: (1) Edit `fitness/profile.yaml` — set `weekly_training_days: 3`, `training_days: [mon, wed, fri]`, `training_window: "05:00-05:30"`. (2) Write `fitness/profile.md` — regenerate the Obsidian view from the updated `profile.yaml` (see "Fitness views" above). (3) Edit `journal/2026-05-11.md` — append a decision entry explaining why mornings (sleep with daughter, cortisol/leptin, BDNF benefit before focus work), why 3 not 5 (avoid burnout in week two), what trade-offs were considered. (4) If this changes a durable fact about Jason's life, also update `memory/user_family_and_schedule.md` and `memory/MEMORY.md`. Reply: "Locked. Updated profile.yaml and journal'd the reasoning. Memory file noted."
 
 **Refinement**
 > Last turn ended: "Saved your workout plan to `fitness/plans/2026-05-11-workout-pull-day.md`."
