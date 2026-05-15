@@ -464,3 +464,165 @@ def test_main_weekly_returns_nonzero_on_digest_error(monkeypatch) -> None:
 
     monkeypatch.setattr(digest, "run_weekly_digest", boom)
     assert digest.main(["--mode=weekly"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Daily digest prompt rewrite (issue #22) — wider scope, sharp prompts,
+# persistence escalation. These tests pin the *contract* in prompts/digest.md
+# rather than live LLM behavior; we treat the prompt file as a public API and
+# assert the new section names, escalation language, and tool affordances are
+# all present in the daily section.
+# ---------------------------------------------------------------------------
+
+
+def _read_daily_section() -> str:
+    """Return just the daily section of ``prompts/digest.md``.
+
+    The file carries a daily section and a weekly section separated by the
+    ``# Weekly reflection`` heading. Slicing here keeps the assertions from
+    accidentally passing because the same string appears under weekly.
+    """
+    path = digest.build_digest_argv_prompt_path("daily")
+    text = path.read_text(encoding="utf-8")
+    daily_start = text.index("# Daily digest")
+    weekly_start = text.index("# Weekly reflection")
+    return text[daily_start:weekly_start]
+
+
+def test_daily_digest_lists_five_message_sections() -> None:
+    """The rewritten daily section enumerates the five new message sections
+    by name: due today/overdue, coming up, undated obligations, threads in
+    motion, reflection prompts. Each must be discoverable in the prompt so
+    the LLM has a checklist to assemble from."""
+    daily = _read_daily_section()
+    assert "Due today" in daily or "due today" in daily
+    assert "overdue" in daily.lower()
+    assert "Coming up" in daily or "coming up" in daily
+    assert "14" in daily  # the ≤14-day window
+    assert "Undated obligations" in daily or "undated obligations" in daily.lower()
+    assert "Threads in motion" in daily or "threads in motion" in daily.lower()
+    assert "reflection prompt" in daily.lower()
+
+
+def test_daily_digest_calls_for_persistence_escalation() -> None:
+    """Overdue items must be annotated with how long they've been overdue
+    ("since 5/12 — 4 days") and the phrasing must escalate past 2 days."""
+    daily = _read_daily_section()
+    lowered = daily.lower()
+    # Persistence is computed from JSONL ts/due; the spec must say so.
+    assert "persistence" in lowered or "days overdue" in lowered or "how long" in lowered
+    # The 2-day escalation threshold is named explicitly.
+    assert "2 days" in lowered or "two days" in lowered
+    assert "escalat" in lowered  # "escalate" / "escalation"
+
+
+def test_daily_digest_persistence_computed_from_jsonl_not_audit() -> None:
+    """Persistence escalation must come from ``reminders.jsonl`` ts/due
+    fields directly. The digest stays out of ``_audit/``/``_index/``/
+    ``_chat_log/``."""
+    daily = _read_daily_section()
+    # The reminders.jsonl source is named as the persistence input.
+    assert "reminders.jsonl" in daily
+    # The kernel-managed dirs are explicitly off-limits.
+    assert "_audit" in daily
+    assert "_index" in daily
+    assert "_chat_log" in daily
+
+
+def test_daily_digest_threads_in_motion_pulls_from_memory_and_journal() -> None:
+    """Threads-in-motion is sourced from ``memory/MEMORY.md`` (project_*.md
+    and in-flight user_*.md files) plus unresolved decisions in the last 3
+    days of ``journal/``. Both sources must be named in the prompt."""
+    daily = _read_daily_section()
+    assert "memory/MEMORY.md" in daily
+    assert "project_" in daily
+    assert "user_" in daily
+    assert "journal/" in daily
+    assert "3 days" in daily.lower() or "three days" in daily.lower()
+
+
+def test_daily_digest_reflection_prompts_grounded_and_capped_at_three() -> None:
+    """At most 3 reflection prompts, each grounded in a specific event from
+    the last 1-3 days. The 'could only have been written for today' test is
+    the spec's quality bar — both must be in the prompt."""
+    daily = _read_daily_section()
+    lowered = daily.lower()
+    # Cap is 3 prompts.
+    assert "3 reflection" in lowered or "three reflection" in lowered or "at most 3" in lowered
+    # The grounded/specific-event quality bar.
+    assert "grounded" in lowered or "specific event" in lowered
+    # The "could only have been written for today" test (or a paraphrase
+    # carrying the same anti-generic intent).
+    assert "could only have been written" in lowered or "only for today" in lowered
+
+
+def test_daily_digest_lifts_read_only_rule_and_lists_write_tools() -> None:
+    """The rewrite lifts the previous read-only constraint and grants the
+    daily turn Read, Glob, Grep, Edit, Write. Writes are *rare and
+    explicit* — the prompt must say so to prevent gratuitous mutation."""
+    daily = _read_daily_section()
+    # All five tools are listed for the daily turn.
+    for tool in ("Read", "Glob", "Grep", "Edit", "Write"):
+        assert tool in daily, f"{tool} should be listed for the daily turn"
+    # Writes are constrained — the prompt must call them out as rare /
+    # exceptional rather than routine.
+    lowered = daily.lower()
+    assert "rare" in lowered or "exception" in lowered or "explicit" in lowered
+
+
+def test_daily_digest_message_length_scales_to_content() -> None:
+    """Default short, denser when content warrants — the rewrite must say
+    so explicitly so the LLM doesn't pad quiet days or truncate heavy
+    ones. The single-sentence all-clear branch survives."""
+    daily = _read_daily_section()
+    lowered = daily.lower()
+    # The length-scales-to-content rule is stated.
+    assert "scale" in lowered or "scales" in lowered or "scaling" in lowered or "denser" in lowered
+    # Default short remains.
+    assert "short" in lowered
+    # The all-clear branch (quiet day) is still a single-sentence message.
+    assert "all-clear" in lowered or "nothing pressing" in lowered
+
+
+def test_daily_digest_voice_rules_retained() -> None:
+    """No robotic section headers, contractions, no emoji unless Jason uses
+    one first — the voice rules from the previous spec must survive."""
+    daily = _read_daily_section()
+    lowered = daily.lower()
+    assert "contraction" in lowered
+    assert "emoji" in lowered
+    # No-robotic-headers rule survives.
+    assert "header" in lowered
+
+
+def test_daily_digest_undated_obligations_filters_to_money_people_projects() -> None:
+    """The Undated obligations section is the filter for the long tail of
+    open reminders without ``due`` dates — it must mention the money /
+    people / projects filter so the digest doesn't dump every undated
+    chore."""
+    daily = _read_daily_section()
+    lowered = daily.lower()
+    assert "undated" in lowered
+    # The triage filter — only money / people / projects flavoured items.
+    assert "money" in lowered
+    assert ("people" in lowered or "person" in lowered)
+    assert "project" in lowered
+
+
+def test_daily_digest_anniversary_and_rogers_use_case_is_documented() -> None:
+    """The rewrite was triggered by a real 2026-05-15 failure: the digest
+    ignored the anniversary app (due 5/26) and the Rogers $8,280 payment
+    (due 5/27). The prompt must call out the "coming up" window so those
+    items surface — a future digest with that vault state must include
+    both. We assert structurally: the prompt explains *why* coming-up
+    matters and lists what kinds of items qualify."""
+    daily = _read_daily_section()
+    lowered = daily.lower()
+    # The 14-day window is named.
+    assert "14" in lowered
+    # The window's purpose — surface items due within roughly two weeks so
+    # Jason isn't blindsided — is in the prose. "Due" + "next" / "ahead"
+    # framing is what we expect.
+    assert "due" in lowered
+    # Sorting rule is explicit so the LLM doesn't reorder by salience.
+    assert "sort" in lowered or "order" in lowered
