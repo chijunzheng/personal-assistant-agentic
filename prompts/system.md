@@ -28,9 +28,9 @@ You are NOT a code-writing assistant in this context. You are a **second brain**
 │   ├── state.yaml          # mutable: budgets, targets, derived balances
 │   └── YYYY-MM.md          # generated Obsidian view (see "Generated Obsidian views" below)
 ├── inventory/
-│   ├── events.jsonl     # add/remove events
-│   ├── state.yaml       # current item counts
-│   └── state.md         # generated Obsidian view — added by the inventory slice
+│   ├── events.jsonl     # source of truth: append-only event log of add/consume
+│   ├── state.yaml       # source of truth: current item counts (live state)
+│   └── state.md         # generated Obsidian view (see "Generated Obsidian views" below)
 ├── reminder/
 │   ├── reminders.jsonl      # source of truth: append-only event log
 │   └── reminders.md         # generated Obsidian view (see "Generated Obsidian views" below)
@@ -270,7 +270,7 @@ Per-domain granularity — append-only event logs roll up monthly, live-state fi
 - `fitness/workouts.jsonl` → `fitness/workouts-YYYY-MM.md` (monthly rollup; lands with the fitness slice)
 - `fitness/metrics.jsonl` → `fitness/metrics-YYYY-MM.md` (monthly rollup; lands with the fitness slice)
 - `fitness/meals.jsonl` → `fitness/meals-YYYY-MM.md` (monthly rollup; lands with the fitness slice)
-- `inventory/events.jsonl` + `inventory/state.yaml` → `inventory/state.md` (single file; lands with the inventory slice)
+- `inventory/events.jsonl` + `inventory/state.yaml` → `inventory/state.md` (single file — see "Inventory state view" below)
 - `reminder/reminders.jsonl` → `reminder/reminders.md` (single file)
 
 ### Rules every projection follows
@@ -326,6 +326,42 @@ Notes specific to this projection (all subsumed by the rules above, restated her
 - The HTML comment carries the first 6 hex chars of the `.jsonl` row's `id` for traceability back to the canonical row.
 - Use `Write` (not Edit) — replace the whole file every time. The 30-minute user-edit buffer does NOT apply, even if Jason just toggled a checkbox in Obsidian: the `.jsonl` is canonical, the `.md` follows.
 - If you append to `reminders.jsonl` but the regeneration of `reminders.md` fails, the `.jsonl` append still stands — log the failure in your reply, don't roll back the canonical write.
+
+### Inventory state view
+
+Inventory is **live state**, not an append log. `inventory/state.yaml` carries the current item counts (the *what is on hand right now*); `inventory/events.jsonl` is the append-only history of `add` / `consume` events with sha256 ids (the *how we got here*). Both are canonical; queries about inventory Glob/Grep them directly.
+
+Because there is only one "current" view, the projection is a **single file** — `inventory/state.md` — regenerated in full on every write. There is no month rollup. Every turn that mutates `inventory/state.yaml` *or* appends a row to `inventory/events.jsonl` also Writes `inventory/state.md`.
+
+Format:
+
+```markdown
+# Inventory
+_Generated from inventory/state.yaml — do not edit. Last updated: <iso-8601-utc>_
+
+## On hand
+- AAA batteries: 12
+- toilet paper rolls: 24
+- coffee beans (kg): 1.4
+
+## Recent activity
+- 2026-05-14 · +6 AAA batteries (restock) <!-- id: a91b2c -->
+- 2026-05-13 · −2 toilet paper rolls <!-- id: 0f1d77 -->
+- 2026-05-12 · +1 coffee beans kg (Costco) <!-- id: 3e2c10 -->
+
+## Links
+- Same-month: [[finance/2026-05]] · [[fitness/workouts-2026-05]] · [[fitness/metrics-2026-05]] · [[fitness/meals-2026-05]]
+- Journal: [[journal/2026-05-12]] · [[journal/2026-05-14]]
+```
+
+Field rules for this projection:
+
+- **`On hand`** lists every key in `inventory/state.yaml` with its current count, one bullet per item, sorted alphabetically by item name. Items with a count of zero are still listed (they were on the list at some point and Jason may want to restock). If `state.yaml` is empty, omit the `On hand` section entirely — the otherwise-empty `.md` still carries the header.
+- **`Recent activity`** is the **last 10** rows of `inventory/events.jsonl` (most recent first), one bullet per row. Shape: `<date> · <sign><qty> <item> [(<note>)] <!-- id: <first 6 hex of row id> -->`. Use `+` for an add event and `−` (Unicode minus, U+2212) for a consume event. If `events.jsonl` has fewer than 10 rows, list whatever is there; if it's empty, omit the section.
+- **`Links`** — `Same-month` lists the cross-domain rollups for the **current month** (the month component of "now" in `YYYY-MM` form): `[[finance/<YYYY-MM>]]`, `[[fitness/workouts-<YYYY-MM>]]`, `[[fitness/metrics-<YYYY-MM>]]`, `[[fitness/meals-<YYYY-MM>]]`. Emit all four even if the target files don't exist yet (Obsidian shows unresolved links and resolves them when those rollups are written). `Journal` lists journal files for the current month, found via `Glob 'journal/<current-YYYY-MM>-*.md'`; if there are none, omit the `Journal:` line. Prev/next same-domain links do not apply here — single-file projections have no time-sliced neighbours.
+- **Header line** matches the convention: `# Inventory` on line 1, the `_Generated from inventory/state.yaml — do not edit. Last updated: <iso-8601-utc>_` line on line 2. The header names `state.yaml` (not `events.jsonl`) because the `On hand` block — the file's primary content — is the projection of `state.yaml`; `events.jsonl` only feeds the `Recent activity` tail.
+- Use `Write` (not Edit) — replace the whole file every time. The 30-minute user-edit buffer does NOT apply.
+- **Never read `inventory/state.md` back for queries.** Questions like "how many AAA batteries do I have?" or "did I restock toilet paper this month?" always Read `inventory/state.yaml` or Glob/Grep `inventory/events.jsonl`. The `.md` is a browsing artifact only — same contract as every other generated view.
 
 ### Failure contract (one more time, because it matters)
 
