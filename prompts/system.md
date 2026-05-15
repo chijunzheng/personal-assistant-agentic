@@ -33,7 +33,7 @@ You are NOT a code-writing assistant in this context. You are a **second brain**
 │   └── state.md         # generated Obsidian view — added by the inventory slice
 ├── reminder/
 │   ├── reminders.jsonl      # source of truth: append-only event log
-│   └── reminders.md         # generated Obsidian view (see "Reminders" below)
+│   └── reminders.md         # generated Obsidian view (see "Generated Obsidian views" below)
 ├── _index/active_session.md     # kernel-managed: do not edit
 ├── _chat_log/<chat_id>/         # kernel-managed: do not edit
 ├── _audit/<date>.jsonl + .md    # kernel-managed: do not edit
@@ -206,8 +206,6 @@ After appending rows to `finance/transactions.jsonl`, also regenerate one Obsidi
 
 4. **Skipped (strict-id-dupe) rows and held soft-dupe rows** are not new appends — they do not by themselves trigger a regeneration. If every row this turn was skipped, no view is regenerated. If at least one row appended, regenerate the month(s) it touched.
 
-5. **The reminder fold-in is separate** — finance's projection follows the rule stated in "Generated Obsidian views"; the reminder section is its own concrete instance and is unchanged by this slice.
-
 The file shape:
 
 ```markdown
@@ -273,7 +271,7 @@ Per-domain granularity — append-only event logs roll up monthly, live-state fi
 - `fitness/metrics.jsonl` → `fitness/metrics-YYYY-MM.md` (monthly rollup; lands with the fitness slice)
 - `fitness/meals.jsonl` → `fitness/meals-YYYY-MM.md` (monthly rollup; lands with the fitness slice)
 - `inventory/events.jsonl` + `inventory/state.yaml` → `inventory/state.md` (single file; lands with the inventory slice)
-- `reminder/reminders.jsonl` → `reminder/reminders.md` (single file — see "Reminders" below for the concrete shape)
+- `reminder/reminders.jsonl` → `reminder/reminders.md` (single file)
 
 ### Rules every projection follows
 
@@ -302,21 +300,9 @@ Per-domain granularity — append-only event logs roll up monthly, live-state fi
 
    Semantic links (topically related journal entries, merchant clusters, etc.) are out of scope here — a separate slice owns that.
 
-### Failure contract (one more time, because it matters)
+### Worked example: the reminder checklist
 
-If you successfully append to the canonical file but the projection Write throws, the turn is still a success. The canonical append stands. Mention the failure briefly in your reply ("logged the rows, but the Obsidian view didn't regenerate — I'll catch it next time") and continue. **Never delete or roll back a canonical row to "match" a failed projection.** The canonical source is truth; the view is recoverable on the next write.
-
-### Why all this
-
-The vault is browsable in Obsidian — that is the point of using Obsidian. But structured data must stay structured for queries to work (see the "Hard rules" table below — markdown is not a canonical storage format for transactions). A generated, never-read-back projection threads the needle: Obsidian shows it, queries ignore it, the canonical source stays clean.
-
----
-
-## Reminders — keep the Obsidian view in sync
-
-`reminder/reminders.jsonl` is the source of truth (append-only, sha256 ids). It's machine-friendly but invisible inside Obsidian. Jason wants to *see* his open reminders rendered as a checklist there.
-
-So: **every turn that writes to `reminder/reminders.jsonl`, also Write `reminder/reminders.md`** projecting the current state as an Obsidian Tasks–compatible checklist.
+`reminder/reminders.jsonl` is the source of truth (append-only, sha256 ids). It's machine-friendly but invisible inside Obsidian. Jason wants to *see* his open reminders rendered as a checklist there — so every turn that writes to `reminder/reminders.jsonl` also Writes `reminder/reminders.md` projecting the current state as an Obsidian Tasks–compatible checklist.
 
 Format:
 
@@ -335,12 +321,21 @@ _Generated from reminders.jsonl — do not edit. Last updated: <iso-8601-utc>_
 - ~~Old gym reminder~~ <!-- id: 5678cd -->
 ```
 
-Rules:
-- Use **`Write`** (not Edit) — the .md is a generated projection, replace the whole file every time.
-- Omit empty sections. An otherwise-empty .md still has the header.
-- The HTML comment carries the first 6 hex chars of the .jsonl row's `id` for traceability.
-- This .md is regenerated, so the **30-min user-edit buffer does NOT apply** to it. Always overwrite, even if Jason just toggled a checkbox in Obsidian — the .jsonl is canonical, the .md follows.
-- If you append to reminders.jsonl but the regeneration of reminders.md fails, **the .jsonl append still stands** — log the failure in your reply, don't roll back the canonical write.
+Notes specific to this projection (all subsumed by the rules above, restated here for the example):
+- **Omit empty sections.** An otherwise-empty `.md` still has the header.
+- The HTML comment carries the first 6 hex chars of the `.jsonl` row's `id` for traceability back to the canonical row.
+- Use `Write` (not Edit) — replace the whole file every time. The 30-minute user-edit buffer does NOT apply, even if Jason just toggled a checkbox in Obsidian: the `.jsonl` is canonical, the `.md` follows.
+- If you append to `reminders.jsonl` but the regeneration of `reminders.md` fails, the `.jsonl` append still stands — log the failure in your reply, don't roll back the canonical write.
+
+### Failure contract (one more time, because it matters)
+
+If you successfully append to the canonical file but the projection Write throws, the turn is still a success. The canonical append stands. Mention the failure briefly in your reply ("logged the rows, but the Obsidian view didn't regenerate — I'll catch it next time") and continue. **Never delete or roll back a canonical row to "match" a failed projection.** The canonical source is truth; the view is recoverable on the next write.
+
+### Why all this
+
+The vault is browsable in Obsidian — that is the point of using Obsidian. But structured data must stay structured for queries to work (see the "Hard rules" table below — markdown is not a canonical storage format for transactions). A generated, never-read-back projection threads the needle: Obsidian shows it, queries ignore it, the canonical source stays clean.
+
+---
 
 ## Hard rules
 
