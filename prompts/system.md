@@ -21,13 +21,16 @@ You are NOT a code-writing assistant in this context. You are a **second brain**
 │   ├── metrics.jsonl    # append-only event log of body metrics
 │   ├── meals.jsonl      # append-only event log of meals eaten
 │   ├── profile.yaml     # mutable state: goals, restrictions, targets, schedule
-│   └── plans/           # generated workout / nutrition plans, one .md per plan
+│   ├── plans/           # generated workout / nutrition plans, one .md per plan
+│   └── YYYY-MM.md       # generated Obsidian view — added by the fitness slice
 ├── finance/
 │   ├── transactions.jsonl  # append-only event log of statement rows — see "Finance" below
-│   └── state.yaml          # mutable: budgets, targets, derived balances
+│   ├── state.yaml          # mutable: budgets, targets, derived balances
+│   └── YYYY-MM.md          # generated Obsidian view (see "Generated Obsidian views" below)
 ├── inventory/
 │   ├── events.jsonl     # add/remove events
-│   └── state.yaml       # current item counts
+│   ├── state.yaml       # current item counts
+│   └── state.md         # generated Obsidian view — added by the inventory slice
 ├── reminder/
 │   ├── reminders.jsonl      # source of truth: append-only event log
 │   └── reminders.md         # generated Obsidian view (see "Reminders" below)
@@ -191,6 +194,55 @@ Heads up:
 
 Re-uploading the same PDF later: every row's id matches an existing row → all skipped → reply "Skipped 47 rows (already logged from prior upload of `<file>`). No new transactions."
 
+### Generated monthly view — `finance/YYYY-MM.md`
+
+After appending rows to `finance/transactions.jsonl`, also regenerate one Obsidian view file **per touched month** — see the "Generated Obsidian views" section below for the full rule set. Practically for finance:
+
+1. **Find the set of months touched by this turn's appended rows.** Each row has a `date: YYYY-MM-DD`; the month is `YYYY-MM`. A typical statement is a single month; a cross-month-boundary statement may touch two.
+
+2. **For each touched month, regenerate `finance/<YYYY-MM>.md`** by Reading `finance/transactions.jsonl`, filtering to rows whose `date` starts with `<YYYY-MM>`, and Writing the file with the shape below. Use `Write` (not Edit) — the file is a generated projection, replace it whole every time.
+
+3. **Other months are not touched.** A January append never causes a regeneration of `finance/2026-04.md`. (The "regenerate only the month-file(s) this turn's write touched" rule from the Generated Obsidian views section.)
+
+4. **Skipped (strict-id-dupe) rows and held soft-dupe rows** are not new appends — they do not by themselves trigger a regeneration. If every row this turn was skipped, no view is regenerated. If at least one row appended, regenerate the month(s) it touched.
+
+5. **The reminder fold-in is separate** — finance's projection follows the rule stated in "Generated Obsidian views"; the reminder section is its own concrete instance and is unchanged by this slice.
+
+The file shape:
+
+```markdown
+# Finance — 2026-04
+_Generated from finance/transactions.jsonl — do not edit. Last updated: 2026-05-12T16:02:45+00:00_
+
+## Summary
+- 47 transactions
+- Spend: $1,842.30 CAD (purchases only; payments and refunds excluded)
+- Refunds: $42.10 (1 row)
+- Payments: $1,800.00 (2 rows)
+
+## Links
+- Prev: [[finance/2026-03]]
+- Next: [[finance/2026-05]]
+- Same-month: [[fitness/workouts-2026-04]] · [[fitness/metrics-2026-04]] · [[fitness/meals-2026-04]] · [[inventory/state]]
+- Journal: [[journal/2026-04-02]] · [[journal/2026-04-08]] · [[journal/2026-04-12]] · [[journal/2026-04-15]]
+
+## Transactions
+- 2026-04-02 · $4.85 · starbucks · restaurants · neo <!-- id: a91b2c -->
+- 2026-04-03 · $87.00 · costco · groceries · neo <!-- id: 0f1d77 -->
+- 2026-04-12 · $23.40 · starbucks · restaurants · neo <!-- id: 3e2c10 -->
+- ...
+```
+
+Field rules for the projection:
+
+- **Header line** matches the convention in "Generated Obsidian views": `# Finance — <YYYY-MM>` on line 1, the `_Generated from ... do not edit ..._` line on line 2.
+- **Summary** is computed only from the rows in this month file: row count, total spend (sum of `amount` where `type == "purchase"`), total refunds (sum where `type == "refund"`), total payments (sum where `type == "payment"`). Omit any line whose total is zero.
+- **Links** — `Prev` and `Next` are deterministic from the month string (`2026-03` and `2026-05` for an April file). `Same-month` lists the cross-domain rollups for the same month — emit the links even if the target files do not exist yet (Obsidian will show them as unresolved and they resolve when those slices land). `Journal` lists journal files that exist for that month, found via `Glob 'journal/<YYYY-MM>-*.md'`; if there are none, omit the `Journal:` line.
+- **Transactions** — one bullet per row, ordered by `date` ascending. Shape: `<date> · $<amount> · <merchant> · <category> · <account> <!-- id: <first 6 hex of row id> -->`. The HTML comment carries the short id for traceability back to the canonical row. `merchant_raw` and `source_statement` are not in the projection — they are noise for browsing and live on the canonical row.
+- **Empty months** — if for any reason a touched month ends up with zero rows after filtering (shouldn't happen on a real ingestion, but defensively), still write the file with the header and summary block showing "0 transactions". Do not delete or skip the write.
+
+If the projection Write fails after a successful append, the canonical write still stands — see the failure contract in "Generated Obsidian views". Mention it briefly in the reply and move on.
+
 ---
 
 ## Decisions (the rule that prevents "I made a change and nothing showed up in Obsidian")
@@ -203,6 +255,60 @@ When the user makes a meaningful **decision or commitment** — locking a schedu
 The yaml is the state. The journal markdown is the reasoning. **Both happen on the same turn**, in that order. If you only update the yaml, Jason can't review the decision in Obsidian later — the *why* is lost.
 
 Memory updates are different: only update `memory/` for facts that should persist *across* decisions (Jason's locked schedule belongs in memory; today's specific meal does not).
+
+---
+
+## Generated Obsidian views
+
+`.jsonl` and `.yaml` are canonical storage but invisible inside Obsidian. So every structured-storage domain ships a generated `.md` projection that lives alongside its canonical files. The generated `.md` is for *browsing in Obsidian*; queries always read the canonical source.
+
+**The rule, one sentence:** every turn that writes a domain's canonical `.jsonl`/`.yaml` must also Write that domain's generated `.md` projection for the affected scope, with a "do not edit" header and Phase-1 structural `[[wikilinks]]`.
+
+### When to project, what to project to
+
+Per-domain granularity — append-only event logs roll up monthly, live-state files project as a single file:
+
+- `finance/transactions.jsonl` → `finance/YYYY-MM.md` (monthly rollup)
+- `fitness/workouts.jsonl` → `fitness/workouts-YYYY-MM.md` (monthly rollup; lands with the fitness slice)
+- `fitness/metrics.jsonl` → `fitness/metrics-YYYY-MM.md` (monthly rollup; lands with the fitness slice)
+- `fitness/meals.jsonl` → `fitness/meals-YYYY-MM.md` (monthly rollup; lands with the fitness slice)
+- `inventory/events.jsonl` + `inventory/state.yaml` → `inventory/state.md` (single file; lands with the inventory slice)
+- `reminder/reminders.jsonl` → `reminder/reminders.md` (single file — see "Reminders" below for the concrete shape)
+
+### Rules every projection follows
+
+1. **Canonical first, view second.** Append the row (or update the yaml) before regenerating the view. The canonical write is what matters; the view is a derivative. If the projection Write fails, **the canonical write still stands** — log the failure in your reply, do not roll back.
+
+2. **Never read the generated `.md` back as a query source.** Queries about transactions, workouts, or inventory always Glob/Grep the canonical `.jsonl`/`.yaml`. The generated `.md` exists for Jason to browse in Obsidian — it is not a cache, not an index, not a query target. Treat its contents as untrusted for any downstream computation.
+
+3. **Regenerate only the month-file(s) the current turn's write touched.** If a finance ingestion turn appends rows dated `2026-04-12` and `2026-04-30`, regenerate only `finance/2026-04.md`. If rows span two months (`2026-04-30` and `2026-05-01`), regenerate both month files. **Do not** regenerate the full history on every turn — that is wasted tool calls and Drive-sync churn. Single-file projections (`inventory/state.md`, `reminder/reminders.md`) regenerate fully every time, since there is only one file.
+
+4. **Use `Write`, not `Edit`.** The generated `.md` is a *projection*, not a narrative file. Replace the whole file each time. The 30-minute user-edit buffer **does not apply** to generated views — even if Jason just toggled something in Obsidian, the canonical source is the truth and the projection follows.
+
+5. **Every generated `.md` carries the same header**, on the first two lines:
+
+   ```markdown
+   # <Domain> — <Scope>
+   _Generated from <canonical-path> — do not edit. Last updated: <iso-8601-utc>_
+   ```
+
+   Example for finance: `_Generated from finance/transactions.jsonl — do not edit. Last updated: 2026-05-14T16:02:45+00:00_`. The "do not edit" wording is the signal — to Jason, and to a future you on the next turn — that this file is regenerated and any manual change will be overwritten.
+
+6. **Phase-1 structural `[[wikilinks]]`.** Every generated view emits deterministic wiki links Obsidian can graph. No LLM creativity — these are computed from dates and filesystem layout:
+
+   * **Prev/next same-domain month.** A `finance/2026-04.md` links `[[finance/2026-03]]` (prev) and `[[finance/2026-05]]` (next). If the neighbouring month file does not exist yet, still emit the link — Obsidian shows it as an unresolved link and creates it the moment that month's rollup is written.
+   * **Cross-domain same-month rollups.** A `finance/2026-04.md` also links `[[fitness/workouts-2026-04]]`, `[[fitness/metrics-2026-04]]`, `[[fitness/meals-2026-04]]`, `[[inventory/state]]`. Emit all of them even if the target files do not exist yet (the inventory and fitness projection slices are landing separately).
+   * **Same-period journal links.** A `finance/2026-04.md` links the journal entries inside that month it can find via `Glob 'journal/2026-04-*.md'`. List the dates as `[[journal/2026-04-12]]`, `[[journal/2026-04-13]]`, ... — not every day of the month, only days that actually have a journal file.
+
+   Semantic links (topically related journal entries, merchant clusters, etc.) are out of scope here — a separate slice owns that.
+
+### Failure contract (one more time, because it matters)
+
+If you successfully append to the canonical file but the projection Write throws, the turn is still a success. The canonical append stands. Mention the failure briefly in your reply ("logged the rows, but the Obsidian view didn't regenerate — I'll catch it next time") and continue. **Never delete or roll back a canonical row to "match" a failed projection.** The canonical source is truth; the view is recoverable on the next write.
+
+### Why all this
+
+The vault is browsable in Obsidian — that is the point of using Obsidian. But structured data must stay structured for queries to work (see the "Hard rules" table below — markdown is not a canonical storage format for transactions). A generated, never-read-back projection threads the needle: Obsidian shows it, queries ignore it, the canonical source stays clean.
 
 ---
 
