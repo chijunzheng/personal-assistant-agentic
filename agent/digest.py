@@ -35,10 +35,12 @@ import json
 import logging
 import os
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Callable
 
+from agent.format import markdown_to_telegram_html
 from agent.runner import ClaudeRunnerError, invoke_claude
 
 __all__ = [
@@ -116,6 +118,12 @@ def _http_post_json(url: str, payload: dict) -> None:
 
     Uses ``urllib`` from the stdlib rather than adding a ``requests``
     dependency — the payload is tiny and the call is one-shot.
+
+    ``urllib.error.HTTPError`` is allowed to propagate verbatim — the
+    caller (``send_telegram_message``) needs to distinguish HTTP 400 (the
+    Telegram "malformed HTML" signal) from other transport failures to
+    drive the plain-text fallback. All other exceptions are wrapped as
+    ``DigestError`` so the run fails loudly.
     """
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -129,10 +137,35 @@ def _http_post_json(url: str, payload: dict) -> None:
             status = getattr(response, "status", 200)
             if status >= 300:
                 raise DigestError(f"Telegram sendMessage returned HTTP {status}")
+    except urllib.error.HTTPError:
+        # Surface the structured HTTPError so the caller can branch on
+        # ``.code`` for the 400 retry-as-plain path.
+        raise
     except DigestError:
         raise
     except Exception as err:  # noqa: BLE001 — urllib raises a wide tree
         raise DigestError(f"Telegram sendMessage POST failed: {err}") from err
+
+
+def _build_send_payload(
+    *,
+    chat_id: str,
+    text: str,
+    parse_mode: str | None,
+) -> dict:
+    """Compose the ``sendMessage`` JSON body.
+
+    ``parse_mode`` is included only when set — the plain-text retry omits
+    it entirely so Telegram does not attempt to parse entities at all.
+    """
+    payload: dict = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if parse_mode is not None:
+        payload["parse_mode"] = parse_mode
+    return payload
 
 
 def send_telegram_message(
@@ -148,27 +181,62 @@ def send_telegram_message(
     needs an incoming ``Message`` to reply to). A scheduled digest has no
     such message, so it addresses the chat directly by id.
 
+    The body is rendered through ``markdown_to_telegram_html`` and sent
+    with ``parse_mode=HTML`` so ``**bold**`` and bullets arrive formatted
+    rather than as literal asterisks. If Telegram rejects the HTML payload
+    with HTTP 400 (malformed markup), we retry once with the raw text and
+    no ``parse_mode`` — the same fallback shape as the bridge's reply path
+    (``_send_reply``'s ``BadRequest`` handler). Users see something either
+    way.
+
     Args:
-        text: the digest body to send.
+        text: the digest body to send (markdown).
         token: the bot token (``TELEGRAM_BOT_TOKEN``).
         chat_id: the destination chat (``TELEGRAM_CHAT_ID``).
         post_fn: injectable HTTP POST; defaults to a real ``urllib`` call.
 
     Raises:
-        DigestError: the POST failed or Telegram returned a non-2xx code.
+        DigestError: the POST failed or Telegram returned a non-2xx code
+            other than the 400 that drives the plain-text retry.
     """
     url = f"{_TELEGRAM_API_BASE}/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
+    html_text = markdown_to_telegram_html(text)
+    html_payload = _build_send_payload(
+        chat_id=chat_id, text=html_text, parse_mode="HTML"
+    )
+
     try:
-        post_fn(url, payload)
+        post_fn(url, html_payload)
+        return
+    except urllib.error.HTTPError as http_err:
+        if http_err.code != 400:
+            raise DigestError(
+                f"Telegram sendMessage failed: HTTP {http_err.code}"
+            ) from http_err
+        logger.warning(
+            "Telegram rejected HTML digest payload (HTTP 400: %s); "
+            "retrying as plain text",
+            http_err.reason if hasattr(http_err, "reason") else http_err,
+        )
     except DigestError:
         raise
     except Exception as err:  # noqa: BLE001 — any transport failure
         raise DigestError(f"Telegram sendMessage failed: {err}") from err
+
+    # Plain-text retry: no ``parse_mode`` and the raw markdown text. If
+    # this also fails, the failure surfaces as ``DigestError`` so the run
+    # exits non-zero — better to fail loudly than swallow a second error.
+    plain_payload = _build_send_payload(
+        chat_id=chat_id, text=text, parse_mode=None
+    )
+    try:
+        post_fn(url, plain_payload)
+    except DigestError:
+        raise
+    except Exception as err:  # noqa: BLE001 — any transport failure
+        raise DigestError(
+            f"Telegram sendMessage plain-text retry failed: {err}"
+        ) from err
 
 
 # ---------------------------------------------------------------------------

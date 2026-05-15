@@ -11,6 +11,9 @@ end-to-end smoke testing uses the CLI: ``python -m agent.digest --mode=daily``.
 
 from __future__ import annotations
 
+import io
+import urllib.error
+
 import pytest
 
 from agent import digest
@@ -60,6 +63,100 @@ def test_send_telegram_message_wraps_post_failure_as_digest_error() -> None:
             chat_id="c",
             post_fn=exploding_post,
         )
+
+
+def test_send_telegram_message_renders_markdown_as_telegram_html() -> None:
+    """The push primitive converts markdown to Telegram-flavored HTML and
+    sets ``parse_mode=HTML`` so ``**Due today:**`` arrives bolded rather
+    than as literal asterisks. Mirrors the reply path's ``_send_reply``."""
+    captured: dict[str, object] = {}
+
+    def fake_post(url: str, payload: dict[str, object]) -> None:
+        captured["payload"] = payload
+
+    digest.send_telegram_message(
+        text="**Due today:** finish PR",
+        token="123:ABC",
+        chat_id="5240954069",
+        post_fn=fake_post,
+    )
+
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["parse_mode"] == "HTML"
+    # Bold survives the conversion; literal asterisks do not.
+    assert payload["text"] == "<b>Due today:</b> finish PR"
+    assert "**" not in payload["text"]
+    # The existing fields stay intact.
+    assert payload["chat_id"] == "5240954069"
+    assert payload["disable_web_page_preview"] is True
+
+
+def test_send_telegram_message_retries_plain_on_http_400() -> None:
+    """When Telegram rejects the HTML payload with HTTP 400 (malformed
+    markup, unbalanced tag, etc.) the send retries once with the raw text
+    and no ``parse_mode`` — same fallback shape as ``_send_reply``'s
+    ``BadRequest`` handler. Users see something either way."""
+    calls: list[dict[str, object]] = []
+
+    def post_with_400(url: str, payload: dict[str, object]) -> None:
+        calls.append({"url": url, "payload": dict(payload)})
+        # Only the first (HTML) call fails; the plain retry succeeds.
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(
+                url=url,
+                code=400,
+                msg="Bad Request: can't parse entities",
+                hdrs=None,
+                fp=io.BytesIO(b""),
+            )
+
+    digest.send_telegram_message(
+        text="**bad** _markup_",
+        token="t",
+        chat_id="c",
+        post_fn=post_with_400,
+    )
+
+    assert len(calls) == 2
+    # First attempt: HTML mode.
+    first = calls[0]["payload"]
+    assert first["parse_mode"] == "HTML"
+    assert first["text"] == "<b>bad</b> <i>markup</i>"
+    # Retry: raw text, no parse_mode at all.
+    second = calls[1]["payload"]
+    assert "parse_mode" not in second
+    assert second["text"] == "**bad** _markup_"
+    assert second["chat_id"] == "c"
+    assert second["disable_web_page_preview"] is True
+
+
+def test_send_telegram_message_does_not_retry_on_non_400_http_error() -> None:
+    """Non-400 HTTP errors (auth, server, rate-limit) are not the
+    malformed-markup signal and must not trigger the plain-text retry —
+    they surface as ``DigestError`` so the run fails loudly."""
+    calls: list[dict[str, object]] = []
+
+    def post_with_500(url: str, payload: dict[str, object]) -> None:
+        calls.append({"url": url, "payload": dict(payload)})
+        raise urllib.error.HTTPError(
+            url=url,
+            code=500,
+            msg="Internal Server Error",
+            hdrs=None,
+            fp=io.BytesIO(b""),
+        )
+
+    with pytest.raises(digest.DigestError):
+        digest.send_telegram_message(
+            text="hi",
+            token="t",
+            chat_id="c",
+            post_fn=post_with_500,
+        )
+
+    # Only one attempt — no retry on 500.
+    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
