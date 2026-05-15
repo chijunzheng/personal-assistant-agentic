@@ -84,9 +84,12 @@ _DAILY_USER_MESSAGE = (
 
 _WEEKLY_USER_MESSAGE = (
     "Generate this week's weekly reflection. Follow the weekly-reflection "
-    "section of your system prompt: review the last 7 days, Write the "
-    "reflection draft into journal/, and reply with the short Telegram "
-    "nudge text only."
+    "section of your system prompt: review the last 7 days across "
+    "fitness/finance/memory/reminders/decisions, Write a substantive "
+    "reflection draft (inline rollups + 4-6 event-grounded prompts) into "
+    "journal/<today>-weekly-reflection.md, and reply with the substantive "
+    "week-in-review Telegram nudge (rollups + open threads with "
+    "age-escalated language + short pointer to the draft file)."
 )
 
 # Map of ``--mode`` value -> the trigger message for that digest turn.
