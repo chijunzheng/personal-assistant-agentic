@@ -1019,3 +1019,198 @@ def test_run_digest_omits_notice_when_no_failure_file_present(
     assert "HTML send failed" not in text
     # And the same clean text reached Telegram.
     assert sent["payload"]["text"] == "Clean digest body."
+
+
+# ---------------------------------------------------------------------------
+# Chunking digests >4096 chars before sending (issue #28)
+#
+# Telegram's sendMessage caps a single message at 4096 chars. After PR #25
+# and #26 lengthened both daily and weekly digests, a heavy day can plausibly
+# exceed the cap; when it does the previous code retried the same too-long
+# text as plain text and failed again, so the user got nothing.
+#
+# The fix lives in the send layer (not the LLM). The four tests below pin
+# the four acceptance criteria from the issue body:
+#   (a) under-the-limit messages still send as a single POST (no regression),
+#   (b) over-the-limit HTML splits on paragraph boundaries with <b>/<i>/<code>
+#       closed at the boundary and reopened in the next chunk,
+#   (c) over-the-limit source markdown chunks on the plain-text fallback path
+#       (no tag-balancing on the plain path),
+#   (d) a single paragraph >4096 chars is hard-split at 4096 rather than
+#       failing the run.
+# ---------------------------------------------------------------------------
+
+
+_TELEGRAM_LIMIT = 4096
+
+
+def test_send_under_limit_uses_single_sendmessage_call() -> None:
+    """Acceptance criterion (a) — no regression for the common case: a
+    digest whose converted HTML is ≤4096 chars sends as a single
+    ``sendMessage`` POST, exactly as it did before chunking landed."""
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url: str, payload: dict[str, object]) -> None:
+        calls.append({"url": url, "payload": dict(payload)})
+
+    # Short, well under the limit even after HTML wrapping.
+    digest.send_telegram_message(
+        text="**Due today:** finish PR\n\nNothing else pressing.",
+        token="t",
+        chat_id="c",
+        post_fn=fake_post,
+    )
+
+    assert len(calls) == 1, f"expected a single POST under the limit, got {len(calls)}"
+    payload = calls[0]["payload"]
+    assert payload["parse_mode"] == "HTML"
+    assert "<b>Due today:</b>" in payload["text"]
+
+
+def test_send_over_limit_splits_html_on_paragraph_boundaries_and_balances_tags() -> None:
+    """Acceptance criterion (b): a converted-HTML digest >4096 chars splits
+    into N chunks, each ≤4096 chars, split on paragraph boundaries
+    (``\\n\\n``), and is POSTed sequentially. Any ``<b>`` / ``<i>`` / ``<code>``
+    that's open at a chunk boundary is closed at the end of chunk K and
+    reopened at the start of chunk K+1 — so every chunk is standalone valid
+    Telegram HTML."""
+    # Build a markdown body large enough that the converted HTML exceeds
+    # 4096 chars, with bold + italic spans on paragraph boundaries we can
+    # assert about. Each filler paragraph is ~200 chars; ~30 of them puts
+    # the converted HTML comfortably over the 4096 ceiling.
+    filler_para = "**bold span** with some plain text that fills out the paragraph " + ("x " * 60)
+    paragraphs = [filler_para] * 30
+    markdown_body = "\n\n".join(paragraphs)
+
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url: str, payload: dict[str, object]) -> None:
+        calls.append({"url": url, "payload": dict(payload)})
+
+    digest.send_telegram_message(
+        text=markdown_body,
+        token="t",
+        chat_id="c",
+        post_fn=fake_post,
+    )
+
+    # Multiple chunks, all HTML mode, all under the Telegram ceiling.
+    assert len(calls) >= 2, f"expected chunked sends, got {len(calls)} call(s)"
+    for idx, call in enumerate(calls):
+        payload = call["payload"]
+        assert payload["parse_mode"] == "HTML", f"chunk {idx} lost parse_mode"
+        assert len(payload["text"]) <= _TELEGRAM_LIMIT, (
+            f"chunk {idx} is {len(payload['text'])} chars, over the {_TELEGRAM_LIMIT} ceiling"
+        )
+
+    # Tag-balancing: every chunk must have equal counts of opening and
+    # closing <b> / <i> / <code> tags. A chunk that opens <b> mid-flight
+    # without closing it would be rejected by Telegram as malformed HTML.
+    for idx, call in enumerate(calls):
+        chunk_text = call["payload"]["text"]
+        for tag in ("b", "i", "code"):
+            opens = chunk_text.count(f"<{tag}>")
+            closes = chunk_text.count(f"</{tag}>")
+            assert opens == closes, (
+                f"chunk {idx} has unbalanced <{tag}>: {opens} open vs {closes} close"
+            )
+
+
+def test_plain_text_fallback_chunks_source_markdown_on_paragraph_boundaries() -> None:
+    """Acceptance criterion (c): when the HTML path fails 400 and the
+    fallback kicks in, the plain-text path also chunks if the source
+    markdown is >4096 chars — split on the source's natural paragraph
+    breaks (``\\n\\n``), no tag-balancing needed. Without this, the
+    fallback would re-trigger the same "message too long" 400."""
+    # Build a source markdown body well over 4096 chars on paragraph breaks.
+    # Each paragraph is ~250 chars; ~25 of them = ~6000 chars of source.
+    paragraph = "this paragraph carries some real prose that takes up space " * 4
+    paragraphs = [paragraph for _ in range(25)]
+    markdown_body = "\n\n".join(paragraphs)
+    assert len(markdown_body) > _TELEGRAM_LIMIT, "test setup must exceed the limit"
+
+    calls: list[dict[str, object]] = []
+
+    def post_with_400_then_succeed(url: str, payload: dict[str, object]) -> None:
+        calls.append({"url": url, "payload": dict(payload)})
+        # Reject every HTML chunk with 400 so the whole HTML path fails
+        # over to plain. Once parse_mode is gone we accept.
+        if payload.get("parse_mode") == "HTML":
+            raise urllib.error.HTTPError(
+                url=url,
+                code=400,
+                msg="Bad Request: message is too long",
+                hdrs=None,
+                fp=io.BytesIO(b""),
+            )
+
+    digest.send_telegram_message(
+        text=markdown_body,
+        token="t",
+        chat_id="c",
+        post_fn=post_with_400_then_succeed,
+    )
+
+    plain_calls = [c for c in calls if "parse_mode" not in c["payload"]]
+    assert len(plain_calls) >= 2, (
+        f"plain fallback must chunk an over-limit source, got {len(plain_calls)} plain call(s)"
+    )
+    # Each plain chunk respects the Telegram ceiling.
+    for idx, call in enumerate(plain_calls):
+        assert len(call["payload"]["text"]) <= _TELEGRAM_LIMIT, (
+            f"plain chunk {idx} is {len(call['payload']['text'])} chars, "
+            f"over the {_TELEGRAM_LIMIT} ceiling"
+        )
+    # The plain chunks reconstruct the source: concatenating them
+    # (paragraph-separated) recovers the original markdown.
+    rejoined = "\n\n".join(c["payload"]["text"] for c in plain_calls)
+    # Allow whitespace-only differences at chunk seams; the substantive
+    # content must round-trip.
+    assert rejoined.strip().replace("\n\n\n", "\n\n") == markdown_body.strip()
+
+
+def test_oversized_single_paragraph_hard_splits_at_limit(caplog) -> None:
+    """Acceptance criterion (d): a single paragraph itself larger than the
+    4096 ceiling cannot be split on ``\\n\\n``. The send layer hard-splits
+    it at the 4096 boundary and logs a warning rather than failing the run
+    — better to deliver a slightly ugly split than to drop the digest.
+
+    Pinned with no surrounding markup so the test isn't entangled with the
+    tag-balancing path."""
+    import logging
+
+    # A single 5000-char paragraph — no double newlines at all.
+    huge_paragraph = "a" * 5000
+    assert "\n\n" not in huge_paragraph, "test setup must be one paragraph"
+    assert len(huge_paragraph) > _TELEGRAM_LIMIT
+
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url: str, payload: dict[str, object]) -> None:
+        calls.append({"url": url, "payload": dict(payload)})
+
+    with caplog.at_level(logging.WARNING, logger="agent.digest"):
+        digest.send_telegram_message(
+            text=huge_paragraph,
+            token="t",
+            chat_id="c",
+            post_fn=fake_post,
+        )
+
+    # Hard-split into 2+ chunks, each ≤4096 chars. The run succeeded
+    # rather than raising.
+    assert len(calls) >= 2, f"expected hard-split chunks, got {len(calls)}"
+    for idx, call in enumerate(calls):
+        assert len(call["payload"]["text"]) <= _TELEGRAM_LIMIT, (
+            f"hard-split chunk {idx} is {len(call['payload']['text'])} chars, "
+            f"over the {_TELEGRAM_LIMIT} ceiling"
+        )
+
+    # A warning was logged about the hard split — operators need to know we
+    # took an ugly path rather than the clean paragraph-boundary one.
+    warning_messages = [
+        rec.getMessage().lower() for rec in caplog.records if rec.levelno >= logging.WARNING
+    ]
+    assert any("hard" in msg or "oversized" in msg or "split" in msg for msg in warning_messages), (
+        f"expected a warning about the hard split, got: {warning_messages}"
+    )

@@ -33,7 +33,7 @@ from __future__ import annotations
 import html
 import re
 
-__all__ = ["markdown_to_telegram_html"]
+__all__ = ["balance_html_tags_across_chunks", "markdown_to_telegram_html"]
 
 
 # ---------------------------------------------------------------------------
@@ -217,3 +217,94 @@ def markdown_to_telegram_html(md: str) -> str:
     # Collapse runs of 3+ newlines that formatting may have introduced.
     md = re.sub(r"\n{3,}", "\n\n", md)
     return md.strip()
+
+
+# ---------------------------------------------------------------------------
+# Chunk-boundary tag balancing (issue #28)
+#
+# Telegram's HTML parser rejects a message that opens a ``<b>`` / ``<i>`` /
+# ``<code>`` and never closes it. When the digest send layer slices an
+# over-4096-char HTML payload on paragraph boundaries, a slice may begin or
+# end mid-tag — e.g. ``<b>some long bold span ...`` lands at the end of
+# chunk K and the closing ``</b>`` is in chunk K+1. The fix: walk each
+# chunk in order, track which simple tags are open at the seam, append the
+# missing closers to chunk K and prepend the corresponding reopeners to
+# chunk K+1. Each chunk then parses standalone.
+#
+# Only the three flat tags Telegram cares about for this slice
+# (``<b>``, ``<i>``, ``<code>``) are balanced — they're the ones the digest
+# actually emits. ``<a href=...>`` is intentionally out of scope: it has an
+# attribute, and our paragraph-boundary splitter never breaks a link
+# because a link cannot straddle a ``\n\n``. ``<pre>`` is also out of
+# scope; code blocks are atomic units in the source markdown and so end up
+# wholly inside a single chunk.
+# ---------------------------------------------------------------------------
+
+
+# Order matters for the reopen prefix: opening order must match the
+# closing order's reverse for nested tags to come back out the same way.
+_BALANCED_TAGS = ("b", "i", "code")
+
+
+def _scan_open_tags(chunk: str, tags: tuple[str, ...]) -> list[str]:
+    """Return the tags currently open at the end of ``chunk``, in
+    open-order. ``<b><i>...<b>`` returns ``["b", "i", "b"]``.
+
+    The scan walks the chunk left-to-right, treating any open/close token
+    for a tracked tag as a push/pop on a stack. We don't try to validate
+    nesting — Telegram doesn't care that ``<b>x<i>y</b>z</i>`` is wrong
+    XML; the converter doesn't produce it; and the only thing the
+    balancer must do is leave each chunk with no *unclosed* tags so the
+    parser accepts it.
+    """
+    pattern = re.compile(r"</?(" + "|".join(tags) + r")>")
+    stack: list[str] = []
+    for match in pattern.finditer(chunk):
+        token = match.group(0)
+        tag = match.group(1)
+        if token.startswith("</"):
+            # Pop the most recent matching open if there is one. If the
+            # closer has no matching opener (e.g. it was opened in a
+            # previous chunk and we're walking only this one), ignore —
+            # the caller scans each chunk in isolation.
+            for i in range(len(stack) - 1, -1, -1):
+                if stack[i] == tag:
+                    del stack[i]
+                    break
+        else:
+            stack.append(tag)
+    return stack
+
+
+def balance_html_tags_across_chunks(chunks: list[str]) -> list[str]:
+    """Close-and-reopen ``<b>`` / ``<i>`` / ``<code>`` across chunk seams.
+
+    Walks ``chunks`` in order. For each chunk K, finds any tracked tags
+    still open at K's end, appends their closers to K, and prepends the
+    same tags (as reopeners, in open-order) to chunk K+1. The result is a
+    list of the same length where every chunk is standalone valid
+    Telegram HTML.
+
+    Empty input or a single chunk passes through unchanged — the function
+    is a no-op when there are no seams.
+    """
+    if len(chunks) <= 1:
+        return list(chunks)
+
+    out = list(chunks)
+    # Tags carried over from the previous chunk's unclosed openers. Each
+    # chunk K reopens whatever K-1 closed.
+    reopen_prefix: list[str] = []
+    for idx in range(len(out)):
+        if reopen_prefix:
+            out[idx] = "".join(f"<{t}>" for t in reopen_prefix) + out[idx]
+        open_at_end = _scan_open_tags(out[idx], _BALANCED_TAGS)
+        if open_at_end and idx < len(out) - 1:
+            # Close in reverse open-order so nested tags unwind LIFO.
+            out[idx] = out[idx] + "".join(
+                f"</{t}>" for t in reversed(open_at_end)
+            )
+            reopen_prefix = list(open_at_end)
+        else:
+            reopen_prefix = []
+    return out
