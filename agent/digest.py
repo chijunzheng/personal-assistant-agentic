@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from agent.format import markdown_to_telegram_html
+from agent.format import balance_html_tags_across_chunks, markdown_to_telegram_html
 from agent.runner import ClaudeRunnerError, invoke_claude
 
 __all__ = [
@@ -101,6 +101,11 @@ _MODE_USER_MESSAGES = {
 
 _TELEGRAM_API_BASE = "https://api.telegram.org"
 _HTTP_TIMEOUT_SEC = 15
+
+# Telegram's ``sendMessage`` hard ceiling for the ``text`` field (4096
+# UTF-16 code units, which we approximate as 4096 chars — close enough
+# for the digest-text shape, which is ASCII-dominant prose). Issue #28.
+_TELEGRAM_MESSAGE_LIMIT = 4096
 
 # Where loud-failure records land inside the vault. Relative to
 # ``VAULT_ROOT``; the directory is created on demand. The shape mirrors
@@ -306,6 +311,79 @@ def _http_post_json(url: str, payload: dict) -> None:
         raise DigestError(f"Telegram sendMessage POST failed: {err}") from err
 
 
+# ---------------------------------------------------------------------------
+# Chunking digests >4096 chars (issue #28)
+#
+# Telegram caps a single ``sendMessage`` at 4096 chars. After the daily +
+# weekly rewrites (#25, #26) widened the read scope, a heavy day can
+# plausibly exceed the cap. The send layer splits on paragraph boundaries
+# (``\n\n``) and POSTs sequentially; tag balancing lives in
+# ``agent/format.py`` so each HTML chunk parses standalone.
+# ---------------------------------------------------------------------------
+
+
+def _chunk_by_paragraphs(text: str, limit: int) -> list[str]:
+    """Greedy paragraph packer: split on ``\\n\\n``, then pack into chunks
+    of ``≤ limit`` chars. A paragraph that is itself ``> limit`` is
+    hard-split at the boundary (with a warning) rather than failing the
+    run — a slightly ugly split is better than a missing digest.
+
+    Pure string math; the caller is responsible for tag balancing on the
+    HTML side and for sequential posting.
+    """
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    paragraphs = text.split("\n\n")
+    chunks: list[str] = []
+    buffer = ""
+    for para in paragraphs:
+        # Hard-split any paragraph that exceeds the limit on its own — the
+        # only way ``\n\n``-based splitting can fail. The pieces become
+        # standalone chunks; subsequent paragraphs continue packing.
+        if len(para) > limit:
+            if buffer:
+                chunks.append(buffer)
+                buffer = ""
+            logger.warning(
+                "Digest paragraph (%d chars) exceeds the %d-char Telegram limit; "
+                "hard-splitting at the boundary",
+                len(para),
+                limit,
+            )
+            for start in range(0, len(para), limit):
+                chunks.append(para[start : start + limit])
+            continue
+
+        # ``\n\n`` separator costs 2 chars between paragraphs in the same
+        # chunk. The buffer accumulates the most paragraphs that still fit.
+        joined = f"{buffer}\n\n{para}" if buffer else para
+        if len(joined) <= limit:
+            buffer = joined
+        else:
+            if buffer:
+                chunks.append(buffer)
+            buffer = para
+    if buffer:
+        chunks.append(buffer)
+    return chunks
+
+
+def _chunk_html_with_tag_balance(html_text: str, limit: int) -> list[str]:
+    """Chunk ``html_text`` on paragraph boundaries then close-and-reopen
+    any ``<b>`` / ``<i>`` / ``<code>`` that straddles a seam, so each
+    chunk is standalone valid Telegram HTML.
+
+    Thin composition of two pure helpers — the paragraph packer and the
+    tag balancer (``agent/format.py``). Kept here so the send-layer flow
+    reads top-to-bottom: split, balance, send sequentially.
+    """
+    chunks = _chunk_by_paragraphs(html_text, limit)
+    return balance_html_tags_across_chunks(chunks)
+
+
 def _build_send_payload(
     *,
     chat_id: str,
@@ -358,6 +436,14 @@ def send_telegram_message(
     fallback behavior itself is unchanged — observability is additive so
     legacy callers (and the existing 400-fallback test) keep working.
 
+    Chunking (issue #28): if the converted HTML exceeds Telegram's 4096-
+    char ceiling, the body is split on paragraph boundaries (``\\n\\n``)
+    and POSTed as multiple sequential ``sendMessage`` calls. Open
+    ``<b>`` / ``<i>`` / ``<code>`` at a seam are closed in chunk K and
+    reopened in K+1 so each chunk is standalone valid Telegram HTML. The
+    plain-text fallback path also chunks (no tag balancing needed) when
+    the source markdown is over the ceiling.
+
     Args:
         text: the digest body to send (markdown).
         token: the bot token (``TELEGRAM_BOT_TOKEN``).
@@ -375,12 +461,22 @@ def send_telegram_message(
     """
     url = f"{_TELEGRAM_API_BASE}/bot{token}/sendMessage"
     html_text = markdown_to_telegram_html(text)
-    html_payload = _build_send_payload(
-        chat_id=chat_id, text=html_text, parse_mode="HTML"
-    )
+    html_chunks = _chunk_html_with_tag_balance(html_text, _TELEGRAM_MESSAGE_LIMIT)
 
+    # Try the HTML chunks first. On any HTTP error from any chunk, log +
+    # dump the failure for that chunk and bail to the plain fallback for
+    # the whole message. Whole-message fallback (not per-chunk) mirrors
+    # the existing pre-#28 semantic: HTML succeeds end-to-end or the
+    # plain path takes over. The trade-off is that a chunk delivered
+    # before the failure may be repeated as plain — acceptable: a
+    # duplicated message is better than a missing one, and 400s on
+    # Telegram-rejected payloads are themselves rare.
     try:
-        post_fn(url, html_payload)
+        for chunk in html_chunks:
+            html_payload = _build_send_payload(
+                chat_id=chat_id, text=chunk, parse_mode="HTML"
+            )
+            post_fn(url, html_payload)
         return
     except urllib.error.HTTPError as http_err:
         # Pull the full body up front — both the log line and the dump
@@ -403,14 +499,18 @@ def send_telegram_message(
     except Exception as err:  # noqa: BLE001 — any transport failure
         raise DigestError(f"Telegram sendMessage failed: {err}") from err
 
-    # Plain-text retry: no ``parse_mode`` and the raw markdown text. If
-    # this also fails, the failure surfaces as ``DigestError`` so the run
-    # exits non-zero — better to fail loudly than swallow a second error.
-    plain_payload = _build_send_payload(
-        chat_id=chat_id, text=text, parse_mode=None
-    )
+    # Plain-text retry: no ``parse_mode``, raw markdown, chunked on the
+    # source's paragraph boundaries if it exceeds the ceiling (no tag
+    # balancing needed for plain text). If this also fails, the failure
+    # surfaces as ``DigestError`` so the run exits non-zero — better to
+    # fail loudly than swallow a second error.
+    plain_chunks = _chunk_by_paragraphs(text, _TELEGRAM_MESSAGE_LIMIT)
     try:
-        post_fn(url, plain_payload)
+        for chunk in plain_chunks:
+            plain_payload = _build_send_payload(
+                chat_id=chat_id, text=chunk, parse_mode=None
+            )
+            post_fn(url, plain_payload)
     except DigestError:
         raise
     except Exception as err:  # noqa: BLE001 — any transport failure
