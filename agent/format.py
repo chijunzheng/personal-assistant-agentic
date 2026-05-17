@@ -33,7 +33,11 @@ from __future__ import annotations
 import html
 import re
 
-__all__ = ["balance_html_tags_across_chunks", "markdown_to_telegram_html"]
+__all__ = [
+    "balance_html_tags_across_chunks",
+    "markdown_to_telegram_html",
+    "strip_markdown_markers",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +278,105 @@ def _scan_open_tags(chunk: str, tags: tuple[str, ...]) -> list[str]:
         else:
             stack.append(tag)
     return stack
+
+
+# ---------------------------------------------------------------------------
+# Plain-text fallback marker stripping (issue #29)
+#
+# The HTML send path is the happy case; when Telegram rejects the HTML payload
+# (a converter bug, an unbalanced glyph, a future Telegram API quirk), the
+# send layer falls back to a plain-text retry. Without stripping, the user
+# sees literal ``**asterisks``, ``# headings``, ``` ` `` ``, ``- bullets``
+# — the exact "raw markdown" failure mode #29 exists to fix.
+#
+# This helper is the plain-text twin of ``markdown_to_telegram_html``: same
+# input vocabulary, different output target. The two live next to each other
+# so a future addition to the Telegram-subset markdown (e.g. ``==highlight==``)
+# updates both in one place.
+#
+# Ordering matters in the same way as the HTML path: code spans / blocks are
+# extracted first so their bodies are shielded from later marker stripping
+# (a ``*`` inside a code block must not be treated as an italic marker).
+# ---------------------------------------------------------------------------
+
+
+_FENCED_BLOCK_STRIP = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\n(.*?)```", re.DOTALL)
+_INLINE_CODE_STRIP = re.compile(r"`([^`\n]+)`")
+_BOLD_STAR_STRIP = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_BOLD_UNDERSCORE_STRIP = re.compile(r"__(.+?)__", re.DOTALL)
+_ITALIC_STAR_STRIP = re.compile(r"(?<!\*)\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)")
+_ITALIC_UNDERSCORE_STRIP = re.compile(r"(?<!_)_(?!\s)([^_\n]+?)(?<!\s)_(?!_)")
+_STRIKE_STRIP = re.compile(r"~~(.+?)~~", re.DOTALL)
+_LINK_STRIP = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+_HEADING_STRIP = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+_BULLET_STRIP = re.compile(r"^(\s*)[-*+]\s+", re.MULTILINE)
+
+
+def strip_markdown_markers(text: str) -> str:
+    """Strip Telegram-subset markdown markers, keeping the underlying text.
+
+    The plain-text twin of ``markdown_to_telegram_html``. Used by the digest
+    send layer's plain-text fallback: when Telegram rejects the HTML payload,
+    the source markdown is run through this helper before the retry POST so
+    the reader sees clean prose instead of literal ``**asterisks**`` and
+    ``# headings``.
+
+    Stripped:
+      * ``**bold**`` / ``__bold__`` / ``*italic*`` / ``_italic_`` -> body
+      * `` `inline code` `` -> body
+      * ` ```fenced code``` ` (with optional language) -> body, no fences
+      * ``~~strikethrough~~`` -> body
+      * Leading ``-``/``*``/``+`` bullets -> text after the marker
+      * Leading ``#``..``######`` headings -> heading text
+      * ``[text](url)`` -> ``text (url)`` — both pieces survive
+
+    The helper is intentionally additive — it does not normalise whitespace
+    beyond what the markdown markers themselves carry. The send layer's
+    paragraph-boundary chunker runs *after* stripping so chunk boundaries
+    land on natural paragraph breaks in the stripped text.
+    """
+    if not text:
+        return text
+
+    # Extract code spans and fenced blocks first so their bodies are shielded
+    # from later marker stripping. A ``*`` inside a code block must not be
+    # treated as an italic marker. Mirrors the placeholder trick used by
+    # ``markdown_to_telegram_html`` for the same reason.
+    code_store: list[str] = []
+
+    def fenced_strip(match: re.Match[str]) -> str:
+        body = match.group(1).rstrip("\n")
+        code_store.append(body)
+        return _make_placeholder(len(code_store) - 1)
+
+    text = _FENCED_BLOCK_STRIP.sub(fenced_strip, text)
+
+    def inline_strip(match: re.Match[str]) -> str:
+        code_store.append(match.group(1))
+        return _make_placeholder(len(code_store) - 1)
+
+    text = _INLINE_CODE_STRIP.sub(inline_strip, text)
+
+    # Bold before italic so the inner ``*`` doesn't match as italic first —
+    # same ordering as the HTML converter.
+    text = _BOLD_STAR_STRIP.sub(r"\1", text)
+    text = _BOLD_UNDERSCORE_STRIP.sub(r"\1", text)
+    text = _STRIKE_STRIP.sub(r"\1", text)
+    text = _ITALIC_STAR_STRIP.sub(r"\1", text)
+    text = _ITALIC_UNDERSCORE_STRIP.sub(r"\1", text)
+    text = _LINK_STRIP.sub(r"\1 (\2)", text)
+    # Headings: drop the ``#`` prefix, keep the heading text.
+    text = _HEADING_STRIP.sub(lambda m: m.group(2), text)
+    # Bullets: drop the leading ``-``/``*``/``+`` marker, preserve any
+    # leading whitespace (so nested bullets stay indented). The text after
+    # the marker — the actual bullet content — survives.
+    text = _BULLET_STRIP.sub(lambda m: m.group(1), text)
+
+    # Restore code bodies in place of their placeholders.
+    for idx, body in enumerate(code_store):
+        text = text.replace(_make_placeholder(idx), body)
+
+    return text
 
 
 def balance_html_tags_across_chunks(chunks: list[str]) -> list[str]:
