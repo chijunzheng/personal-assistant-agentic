@@ -12,6 +12,7 @@ end-to-end smoke testing uses the CLI: ``python -m agent.digest --mode=daily``.
 from __future__ import annotations
 
 import io
+import json
 import urllib.error
 
 import pytest
@@ -380,7 +381,11 @@ def test_run_weekly_digest_reuses_send_telegram_message(tmp_path, monkeypatch) -
 
     calls: list[dict] = []
 
-    def spy_send(*, text, token, chat_id, post_fn):
+    # ``**_extra`` absorbs the loud-observability kwargs (``vault_root``,
+    # ``mode``) added in issue #27. The property under test is "routes
+    # through ``send_telegram_message``", not the exact kwarg surface —
+    # which is covered by the dedicated #27 tests below.
+    def spy_send(*, text, token, chat_id, post_fn, **_extra):
         calls.append({"text": text, "token": token, "chat_id": chat_id})
 
     monkeypatch.setattr(digest, "send_telegram_message", spy_send)
@@ -828,3 +833,189 @@ def test_weekly_prompt_keeps_tool_surface_unchanged() -> None:
     # And no smuggled-in tools.
     assert "WebFetch" not in section
     assert "Bash" not in section
+
+
+# ---------------------------------------------------------------------------
+# Loud observability on Telegram send failures (issue #27)
+#
+# When the HTML send path gets a non-2xx from Telegram, the previous code
+# only logged ``err.reason`` — too vague to root-cause a real failure. The
+# fix needs three loud signals:
+#   (a) full HTTP response body in the log, with html/markdown lengths and
+#       the digest mode;
+#   (b) a structured failure-record JSON dumped under
+#       ``<vault>/_audit/digest-failures/<UTC-ts>-<mode>.json`` so the
+#       operator can replay the exact payload offline;
+#   (c) the *next* digest body is prefixed with a one-line operator notice
+#       naming the most recent failure file — the next digest is the
+#       alert, not the server log.
+# ---------------------------------------------------------------------------
+
+
+def test_send_telegram_message_dumps_failure_record_on_http_400(tmp_path) -> None:
+    """Acceptance criterion (a) + (b): on a non-2xx from the HTML send
+    path, the full HTTP response body is logged AND a structured
+    failure-record JSON is written under
+    ``<vault>/_audit/digest-failures/<UTC-ts>-<mode>.json`` carrying the
+    source markdown, converted HTML, response body, HTTP status, mode, and
+    timestamp. Directory is created on demand.
+
+    The 400 path also keeps its existing plain-text retry — observability
+    is additive, not a behavior change to the fallback itself.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    failure_dir = vault / "_audit" / "digest-failures"
+    # Sanity check the dir does not exist yet; the send must create it.
+    assert not failure_dir.exists()
+
+    response_body = b'{"ok":false,"error_code":400,"description":"can\'t parse entities: unbalanced tag"}'
+    calls: list[dict[str, object]] = []
+
+    def post_with_400(url: str, payload: dict[str, object]) -> None:
+        calls.append({"url": url, "payload": dict(payload)})
+        # Only the first (HTML) call fails; plain retry succeeds.
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(
+                url=url,
+                code=400,
+                msg="Bad Request: can't parse entities",
+                hdrs=None,
+                fp=io.BytesIO(response_body),
+            )
+
+    digest.send_telegram_message(
+        text="**bad** _markup_",
+        token="t",
+        chat_id="c",
+        post_fn=post_with_400,
+        vault_root=vault,
+        mode="daily",
+    )
+
+    # The plain-text retry still happens — observability is additive.
+    assert len(calls) == 2
+
+    # A single failure-record file landed under the expected dir.
+    assert failure_dir.is_dir()
+    files = sorted(failure_dir.glob("*.json"))
+    assert len(files) == 1, f"expected exactly one failure file, found {files}"
+
+    record_path = files[0]
+    # Filename embeds the digest mode so daily vs weekly failures don't
+    # collide and so the operator notice can name the mode.
+    assert record_path.name.endswith("-daily.json"), record_path.name
+
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    # Source markdown (what the LLM produced) is captured verbatim so the
+    # operator can root-cause converter regressions.
+    assert record["source_markdown"] == "**bad** _markup_"
+    # Converted HTML (what we actually sent) is captured so the operator
+    # can see the exact payload Telegram rejected.
+    assert record["converted_html"] == "<b>bad</b> <i>markup</i>"
+    # The full HTTP response body — not just .reason — so Telegram's
+    # error_code + description survives.
+    assert "unbalanced tag" in record["response_body"]
+    assert record["http_status"] == 400
+    assert record["mode"] == "daily"
+    # Timestamp is captured (UTC ISO-8601). Exact value not pinned — just
+    # presence and shape.
+    assert "timestamp" in record
+    assert isinstance(record["timestamp"], str)
+    assert record["timestamp"].endswith("Z") or "+00:00" in record["timestamp"]
+
+
+def test_run_digest_prefixes_notice_when_unconsumed_failure_file_exists(
+    tmp_path, monkeypatch
+) -> None:
+    """Acceptance criterion (c): on the next digest run after a failure,
+    the digest body is prefixed with a single-line operator notice naming
+    the most recent failure file. The operator sees the alert on Telegram
+    without checking server logs.
+
+    Setup: pre-seed a failure-record file as if a prior run crashed. The
+    next ``run_daily_digest`` must prefix the LLM's reply with the notice
+    before pushing.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    failure_dir = vault / "_audit" / "digest-failures"
+    failure_dir.mkdir(parents=True)
+    # Seed a failure file from a hypothetical prior run.
+    failure_filename = "20260515T060000Z-daily.json"
+    (failure_dir / failure_filename).write_text(
+        json.dumps(
+            {
+                "source_markdown": "prior body",
+                "converted_html": "prior html",
+                "response_body": "Bad Request",
+                "http_status": 400,
+                "mode": "daily",
+                "timestamp": "2026-05-15T06:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("VAULT_ROOT", str(vault))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "999:XYZ")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "5240954069")
+
+    sent: dict[str, object] = {}
+
+    def fake_invoke(_user_message, **_kwargs):
+        return ("Today's digest body.", 1, 1, ())
+
+    def fake_post(url: str, payload: dict) -> None:
+        sent["payload"] = payload
+
+    text = digest.run_daily_digest(invoke_fn=fake_invoke, post_fn=fake_post)
+
+    # The returned text and the pushed text both carry the operator notice
+    # as the first line. The notice names the failure file so the operator
+    # can jump straight to it.
+    first_line = text.splitlines()[0]
+    assert "HTML send failed" in first_line
+    assert failure_filename in first_line
+    # The original LLM body still follows the notice; the prefix is
+    # additive, not a replacement.
+    assert "Today's digest body." in text
+    # And the same prefixed text reached Telegram (so the operator notice
+    # is visible in the chat, not just the return value).
+    sent_text = sent["payload"]["text"]
+    assert "HTML send failed" in sent_text
+    assert failure_filename in sent_text
+
+
+def test_run_digest_omits_notice_when_no_failure_file_present(
+    tmp_path, monkeypatch
+) -> None:
+    """Acceptance criterion (c) — negative case: with no unconsumed
+    failure file, the next digest runs clean. The prefix exists only as
+    long as there's something to alert about; once the operator (or a
+    successful prior consume) clears the file, the digest goes back to
+    its normal shape.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    # Note: digest-failures directory does not even exist. The notice
+    # logic must tolerate that — it is the steady-state shape.
+    monkeypatch.setenv("VAULT_ROOT", str(vault))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "999:XYZ")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "5240954069")
+
+    sent: dict[str, object] = {}
+
+    def fake_invoke(_user_message, **_kwargs):
+        return ("Clean digest body.", 1, 1, ())
+
+    def fake_post(url: str, payload: dict) -> None:
+        sent["payload"] = payload
+
+    text = digest.run_daily_digest(invoke_fn=fake_invoke, post_fn=fake_post)
+
+    # No prefix added — the digest body is what the LLM returned, period.
+    assert text == "Clean digest body."
+    assert "HTML send failed" not in text
+    # And the same clean text reached Telegram.
+    assert sent["payload"]["text"] == "Clean digest body."
