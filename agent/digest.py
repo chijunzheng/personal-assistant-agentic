@@ -41,7 +41,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from agent.format import balance_html_tags_across_chunks, markdown_to_telegram_html
+from agent.format import (
+    balance_html_tags_across_chunks,
+    markdown_to_telegram_html,
+    strip_markdown_markers,
+)
 from agent.runner import ClaudeRunnerError, invoke_claude
 
 __all__ = [
@@ -423,10 +427,13 @@ def send_telegram_message(
     The body is rendered through ``markdown_to_telegram_html`` and sent
     with ``parse_mode=HTML`` so ``**bold**`` and bullets arrive formatted
     rather than as literal asterisks. If Telegram rejects the HTML payload
-    with HTTP 400 (malformed markup), we retry once with the raw text and
-    no ``parse_mode`` — the same fallback shape as the bridge's reply path
-    (``_send_reply``'s ``BadRequest`` handler). Users see something either
-    way.
+    with HTTP 400 (malformed markup), we retry once with the source text
+    run through ``strip_markdown_markers`` (issue #29) and no ``parse_mode``
+    — same fallback shape as the bridge's reply path (``_send_reply``'s
+    ``BadRequest`` handler). Stripping is what makes the fallback *readable*:
+    without it the reader would see literal ``**asterisks`` / ``# headings``
+    / ``- bullets`` from the source markdown. Users see something either
+    way; the fallback message just loses formatting, not legibility.
 
     Loud observability (issue #27): when ``vault_root`` and ``mode`` are
     both supplied, a non-2xx from the HTML send path also (a) logs the
@@ -499,12 +506,18 @@ def send_telegram_message(
     except Exception as err:  # noqa: BLE001 — any transport failure
         raise DigestError(f"Telegram sendMessage failed: {err}") from err
 
-    # Plain-text retry: no ``parse_mode``, raw markdown, chunked on the
-    # source's paragraph boundaries if it exceeds the ceiling (no tag
-    # balancing needed for plain text). If this also fails, the failure
-    # surfaces as ``DigestError`` so the run exits non-zero — better to
-    # fail loudly than swallow a second error.
-    plain_chunks = _chunk_by_paragraphs(text, _TELEGRAM_MESSAGE_LIMIT)
+    # Plain-text retry: no ``parse_mode``, marker-stripped source text
+    # (issue #29), chunked on the stripped text's paragraph boundaries if
+    # the result exceeds the ceiling (no tag balancing needed for plain
+    # text). The strip runs *before* chunking so chunk boundaries land on
+    # natural paragraph breaks in the readable output. Without the strip
+    # the user would see literal ``**asterisks`` / ``# headings`` /
+    # ``- bullets`` — the exact "raw markdown" failure mode #29 fixes.
+    # If this also fails, the failure surfaces as ``DigestError`` so the
+    # run exits non-zero — better to fail loudly than swallow a second
+    # error.
+    stripped_text = strip_markdown_markers(text)
+    plain_chunks = _chunk_by_paragraphs(stripped_text, _TELEGRAM_MESSAGE_LIMIT)
     try:
         for chunk in plain_chunks:
             plain_payload = _build_send_payload(

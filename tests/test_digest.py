@@ -124,10 +124,17 @@ def test_send_telegram_message_retries_plain_on_http_400() -> None:
     first = calls[0]["payload"]
     assert first["parse_mode"] == "HTML"
     assert first["text"] == "<b>bad</b> <i>markup</i>"
-    # Retry: raw text, no parse_mode at all.
+    # Retry: stripped text (markers removed for readability), no parse_mode
+    # at all. Issue #29: the fallback strips markdown markers so the reader
+    # sees clean prose instead of literal ``**asterisks**`` / ``_underscores_``.
     second = calls[1]["payload"]
     assert "parse_mode" not in second
-    assert second["text"] == "**bad** _markup_"
+    assert second["text"] == "bad markup"
+    # The stripped text carries no literal markdown markers — the whole point
+    # of the fallback strip is that the fallback message is readable.
+    assert "**" not in second["text"]
+    assert "*" not in second["text"]
+    assert "`" not in second["text"]
     assert second["chat_id"] == "c"
     assert second["disable_web_page_preview"] is True
 
@@ -1167,6 +1174,64 @@ def test_plain_text_fallback_chunks_source_markdown_on_paragraph_boundaries() ->
     # Allow whitespace-only differences at chunk seams; the substantive
     # content must round-trip.
     assert rejoined.strip().replace("\n\n\n", "\n\n") == markdown_body.strip()
+
+
+def test_plain_text_fallback_strips_markdown_markers_before_sending() -> None:
+    """Issue #29 acceptance criterion: when the HTML path fails 400 and the
+    plain-text fallback kicks in, the source markdown is run through the
+    marker-stripping helper *before* posting. Without this the user sees
+    literal ``**asterisks``, ``# headings``, ``` ` `` `` and ``- bullets`` —
+    the exact "raw markdown" failure mode this issue exists to fix.
+
+    Pins the property at the send-layer boundary (what reaches the post_fn),
+    not the helper's internals — those live in ``tests/test_format.py``.
+    """
+    calls: list[dict[str, object]] = []
+
+    def post_with_400_then_succeed(url: str, payload: dict[str, object]) -> None:
+        calls.append({"url": url, "payload": dict(payload)})
+        if payload.get("parse_mode") == "HTML":
+            raise urllib.error.HTTPError(
+                url=url,
+                code=400,
+                msg="Bad Request: can't parse entities",
+                hdrs=None,
+                fp=io.BytesIO(b""),
+            )
+
+    # Source carries every marker class the helper strips. After the strip,
+    # the fallback must POST clean prose — no surviving markdown.
+    source = (
+        "**Due today:** finish PR\n\n"
+        "## Coming up\n\n"
+        "- *Urgent:* Tax filing\n"
+        "- Rogers payment `$8,280`\n\n"
+        "See [the plan](https://example.com/plan)."
+    )
+
+    digest.send_telegram_message(
+        text=source,
+        token="t",
+        chat_id="c",
+        post_fn=post_with_400_then_succeed,
+    )
+
+    plain_calls = [c for c in calls if "parse_mode" not in c["payload"]]
+    assert len(plain_calls) >= 1, "fallback must POST at least one plain chunk"
+    # No markdown markers reach Telegram across any of the plain chunks.
+    plain_text = "\n\n".join(c["payload"]["text"] for c in plain_calls)
+    assert "**" not in plain_text
+    assert "##" not in plain_text
+    assert "`" not in plain_text
+    # Substantive content survives — the reader still gets the message.
+    assert "Due today: finish PR" in plain_text
+    assert "Tax filing" in plain_text
+    assert "Rogers payment $8,280" in plain_text
+    # Link unwraps to ``text (url)`` so both pieces stay accessible.
+    assert "the plan (https://example.com/plan)" in plain_text
+    # And the bullet markers ("- ") at line starts are gone.
+    for line in plain_text.splitlines():
+        assert not line.startswith("- "), f"bullet survived: {line!r}"
 
 
 def test_oversized_single_paragraph_hard_splits_at_limit(caplog) -> None:
